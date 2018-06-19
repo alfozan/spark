@@ -24,7 +24,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, MonotonicallyIncreasingID, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Count
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical.{FlatMapGroupsWithState, _}
@@ -614,6 +614,21 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
   testOutputMode(Update, shouldSupportAggregation = true, shouldSupportNonAggregation = true)
   testOutputMode(Complete, shouldSupportAggregation = true, shouldSupportNonAggregation = false)
 
+  // Unsupported expressions in streaming plan
+  assertNotSupportedInStreamingPlan(
+    "MonotonicallyIncreasingID",
+    streamRelation.select(MonotonicallyIncreasingID()),
+    outputMode = Append,
+    expectedMsgs = Seq("monotonically_increasing_id"))
+
+  assertSupportedForContinuousProcessing(
+    "TypedFilter", TypedFilter(
+      null,
+      null,
+      null,
+      null,
+      new TestStreamingRelationV2(attribute)), OutputMode.Append())
+
   /*
     =======================================================================================
                                      TESTING FUNCTIONS
@@ -763,6 +778,16 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
     }
   }
 
+  /** Assert that the logical plan is supported for continuous procsssing mode */
+  def assertSupportedForContinuousProcessing(
+    name: String,
+    plan: LogicalPlan,
+    outputMode: OutputMode): Unit = {
+    test(s"continuous processing - $name: supported") {
+      UnsupportedOperationChecker.checkForContinuous(plan, outputMode)
+    }
+  }
+
   /**
    * Assert that the logical plan is not supported inside a streaming plan.
    *
@@ -831,5 +856,11 @@ class UnsupportedOperationsSuite extends SparkFunSuite {
   case class TestStreamingRelation(output: Seq[Attribute]) extends LeafNode {
     def this(attribute: Attribute) = this(Seq(attribute))
     override def isStreaming: Boolean = true
+  }
+
+  case class TestStreamingRelationV2(output: Seq[Attribute]) extends LeafNode {
+    def this(attribute: Attribute) = this(Seq(attribute))
+    override def isStreaming: Boolean = true
+    override def nodeName: String = "StreamingRelationV2"
   }
 }

@@ -24,14 +24,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.JavaConverters._
 
 import org.apache.arrow.vector.VectorSchemaRoot
-import org.apache.arrow.vector.stream.{ArrowStreamReader, ArrowStreamWriter}
+import org.apache.arrow.vector.ipc.{ArrowStreamReader, ArrowStreamWriter}
 
 import org.apache.spark._
 import org.apache.spark.api.python._
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.arrow.{ArrowUtils, ArrowWriter}
-import org.apache.spark.sql.execution.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
 import org.apache.spark.util.Utils
 
 /**
@@ -39,64 +39,72 @@ import org.apache.spark.util.Utils
  */
 class ArrowPythonRunner(
     funcs: Seq[ChainedPythonFunctions],
-    batchSize: Int,
     bufferSize: Int,
     reuseWorker: Boolean,
     evalType: Int,
     argOffsets: Array[Array[Int]],
-    schema: StructType)
-  extends BasePythonRunner[InternalRow, ColumnarBatch](
+    schema: StructType,
+    timeZoneId: String,
+    respectTimeZone: Boolean)
+  extends BasePythonRunner[Iterator[InternalRow], ColumnarBatch](
     funcs, bufferSize, reuseWorker, evalType, argOffsets) {
 
   protected override def newWriterThread(
       env: SparkEnv,
       worker: Socket,
-      inputIterator: Iterator[InternalRow],
+      inputIterator: Iterator[Iterator[InternalRow]],
       partitionIndex: Int,
       context: TaskContext): WriterThread = {
     new WriterThread(env, worker, inputIterator, partitionIndex, context) {
 
       protected override def writeCommand(dataOut: DataOutputStream): Unit = {
         PythonUDFRunner.writeUDFs(dataOut, funcs, argOffsets)
+        if (respectTimeZone) {
+          PythonRDD.writeUTF(timeZoneId, dataOut)
+        } else {
+          dataOut.writeInt(SpecialLengths.NULL)
+        }
       }
 
       protected override def writeIteratorToStream(dataOut: DataOutputStream): Unit = {
-        val arrowSchema = ArrowUtils.toArrowSchema(schema)
+        val arrowSchema = ArrowUtils.toArrowSchema(schema, timeZoneId)
         val allocator = ArrowUtils.rootAllocator.newChildAllocator(
           s"stdout writer for $pythonExec", 0, Long.MaxValue)
-
         val root = VectorSchemaRoot.create(arrowSchema, allocator)
-        val arrowWriter = ArrowWriter.create(root)
-
-        var closed = false
-
-        context.addTaskCompletionListener { _ =>
-          if (!closed) {
-            root.close()
-            allocator.close()
-          }
-        }
-
-        val writer = new ArrowStreamWriter(root, null, dataOut)
-        writer.start()
 
         Utils.tryWithSafeFinally {
+          val arrowWriter = ArrowWriter.create(root)
+          val writer = new ArrowStreamWriter(root, null, dataOut)
+          writer.start()
+
           while (inputIterator.hasNext) {
-            var rowCount = 0
-            while (inputIterator.hasNext && (batchSize <= 0 || rowCount < batchSize)) {
-              val row = inputIterator.next()
-              arrowWriter.write(row)
-              rowCount += 1
+            val nextBatch = inputIterator.next()
+
+            while (nextBatch.hasNext) {
+              arrowWriter.write(nextBatch.next())
             }
+
             arrowWriter.finish()
             writer.writeBatch()
             arrowWriter.reset()
           }
-        } {
+          // end writes footer to the output stream and doesn't clean any resources.
+          // It could throw exception if the output stream is closed, so it should be
+          // in the try block.
           writer.end()
+        } {
+          // If we close root and allocator in TaskCompletionListener, there could be a race
+          // condition where the writer thread keeps writing to the VectorSchemaRoot while
+          // it's being closed by the TaskCompletion listener.
+          // Closing root and allocator here is cleaner because root and allocator is owned
+          // by the writer thread and is only visible to the writer thread.
+          //
+          // If the writer thread is interrupted by TaskCompletionListener, it should either
+          // (1) in the try block, in which case it will get an InterruptedException when
+          // performing io, and goes into the finally block or (2) in the finally block,
+          // in which case it will ignore the interruption and close the resources.
           root.close()
           allocator.close()
-          closed = true
         }
       }
     }
@@ -120,18 +128,11 @@ class ArrowPythonRunner(
       private var schema: StructType = _
       private var vectors: Array[ColumnVector] = _
 
-      private var closed = false
-
       context.addTaskCompletionListener { _ =>
-        // todo: we need something like `reader.end()`, which release all the resources, but leave
-        // the input stream open. `reader.close()` will close the socket and we can't reuse worker.
-        // So here we simply not close the reader, which is problematic.
-        if (!closed) {
-          if (root != null) {
-            root.close()
-          }
-          allocator.close()
+        if (reader != null) {
+          reader.close(false)
         }
+        allocator.close()
       }
 
       private var batchLoaded = true
@@ -144,13 +145,12 @@ class ArrowPythonRunner(
           if (reader != null && batchLoaded) {
             batchLoaded = reader.loadNextBatch()
             if (batchLoaded) {
-              val batch = new ColumnarBatch(schema, vectors, root.getRowCount)
+              val batch = new ColumnarBatch(vectors)
               batch.setNumRows(root.getRowCount)
               batch
             } else {
-              root.close()
+              reader.close(false)
               allocator.close()
-              closed = true
               // Reach end of stream. Call `read()` again to read control data.
               read()
             }

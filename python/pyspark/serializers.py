@@ -33,8 +33,9 @@ The serializer is chosen when creating L{SparkContext}:
 [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
 >>> sc.stop()
 
-PySpark serialize objects in batches; By default, the batch size is chosen based
-on the size of objects, also configurable by SparkContext's C{batchSize} parameter:
+PySpark serializes objects in batches; by default, the batch size is chosen based
+on the size of objects and is also configurable by SparkContext's C{batchSize}
+parameter:
 
 >>> sc = SparkContext('local', 'test', batchSize=2)
 >>> rdd = sc.parallelize(range(16), 4).map(lambda x: x)
@@ -68,6 +69,7 @@ else:
     xrange = range
 
 from pyspark import cloudpickle
+from pyspark.util import _exception_message
 
 
 __all__ = ["PickleSerializer", "MarshalSerializer", "UTF8Deserializer"]
@@ -80,12 +82,6 @@ class SpecialLengths(object):
     END_OF_STREAM = -4
     NULL = -5
     START_ARROW_STREAM = -6
-
-
-class PythonEvalType(object):
-    NON_UDF = 0
-    SQL_BATCHED_UDF = 1
-    SQL_PANDAS_UDF = 2
 
 
 class Serializer(object):
@@ -105,7 +101,7 @@ class Serializer(object):
     def _load_stream_without_unbatching(self, stream):
         """
         Return an iterator of deserialized batches (iterable) of objects from the input stream.
-        if the serializer does not operate on batches the default implementation returns an
+        If the serializer does not operate on batches the default implementation returns an
         iterator of single element lists.
         """
         return map(lambda x: [x], self.load_stream(stream))
@@ -212,7 +208,16 @@ class ArrowSerializer(FramedSerializer):
         return "ArrowSerializer"
 
 
-def _create_batch(series):
+def _create_batch(series, timezone):
+    """
+    Create an Arrow record batch from the given pandas.Series or list of Series, with optional type.
+
+    :param series: A single pandas.Series, list of Series, or list of (series, arrow_type)
+    :param timezone: A timezone to respect when handling timestamp values
+    :return: Arrow RecordBatch
+    """
+
+    from pyspark.sql.types import _check_series_convert_timestamps_internal
     import pyarrow as pa
     # Make input conform to [(series1, type1), (series2, type2), ...]
     if not isinstance(series, (list, tuple)) or \
@@ -220,15 +225,20 @@ def _create_batch(series):
         series = [series]
     series = ((s, None) if not isinstance(s, (list, tuple)) else s for s in series)
 
-    # If a nullable integer series has been promoted to floating point with NaNs, need to cast
-    # NOTE: this is not necessary with Arrow >= 0.7
-    def cast_series(s, t):
-        if t is None or s.dtype == t.to_pandas_dtype():
-            return s
-        else:
-            return s.fillna(0).astype(t.to_pandas_dtype(), copy=False)
+    def create_array(s, t):
+        mask = s.isnull()
+        # Ensure timestamp series are in expected form for Spark internal representation
+        if t is not None and pa.types.is_timestamp(t):
+            s = _check_series_convert_timestamps_internal(s.fillna(0), timezone)
+            # TODO: need cast after Arrow conversion, ns values cause error with pandas 0.19.2
+            return pa.Array.from_pandas(s, mask=mask).cast(t, safe=False)
+        elif t is not None and pa.types.is_string(t) and sys.version < '3':
+            # TODO: need decode before converting to Arrow in Python 2
+            return pa.Array.from_pandas(s.apply(
+                lambda v: v.decode("utf-8") if isinstance(v, str) else v), mask=mask, type=t)
+        return pa.Array.from_pandas(s, mask=mask, type=t)
 
-    arrs = [pa.Array.from_pandas(cast_series(s, t), mask=s.isnull(), type=t) for s, t in series]
+    arrs = [create_array(s, t) for s, t in series]
     return pa.RecordBatch.from_arrays(arrs, ["_%d" % i for i in xrange(len(arrs))])
 
 
@@ -236,6 +246,19 @@ class ArrowStreamPandasSerializer(Serializer):
     """
     Serializes Pandas.Series as Arrow data with Arrow streaming format.
     """
+
+    def __init__(self, timezone):
+        super(ArrowStreamPandasSerializer, self).__init__()
+        self._timezone = timezone
+
+    def arrow_to_pandas(self, arrow_column):
+        from pyspark.sql.types import from_arrow_type, \
+            _check_series_convert_date, _check_series_localize_timestamps
+
+        s = arrow_column.to_pandas()
+        s = _check_series_convert_date(s, from_arrow_type(arrow_column.type))
+        s = _check_series_localize_timestamps(s, self._timezone)
+        return s
 
     def dump_stream(self, iterator, stream):
         """
@@ -246,7 +269,7 @@ class ArrowStreamPandasSerializer(Serializer):
         writer = None
         try:
             for series in iterator:
-                batch = _create_batch(series)
+                batch = _create_batch(series, self._timezone)
                 if writer is None:
                     write_int(SpecialLengths.START_ARROW_STREAM, stream)
                     writer = pa.RecordBatchStreamWriter(stream, batch.schema)
@@ -261,9 +284,9 @@ class ArrowStreamPandasSerializer(Serializer):
         """
         import pyarrow as pa
         reader = pa.open_stream(stream)
+
         for batch in reader:
-            table = pa.Table.from_batches([batch])
-            yield [c.to_pandas() for c in table.itercolumns()]
+            yield [self.arrow_to_pandas(c) for c in pa.Table.from_batches([batch]).itercolumns()]
 
     def __repr__(self):
         return "ArrowStreamPandasSerializer"
@@ -439,7 +462,7 @@ class NoOpSerializer(FramedSerializer):
         return obj
 
 
-# Hook namedtuple, make it picklable
+# Hack namedtuple, make it picklable
 
 __cls = {}
 
@@ -503,15 +526,15 @@ def _hijack_namedtuple():
         cls = _old_namedtuple(*args, **kwargs)
         return _hack_namedtuple(cls)
 
-    # replace namedtuple with new one
+    # replace namedtuple with the new one
     collections.namedtuple.__globals__["_old_namedtuple_kwdefaults"] = _old_namedtuple_kwdefaults
     collections.namedtuple.__globals__["_old_namedtuple"] = _old_namedtuple
     collections.namedtuple.__globals__["_hack_namedtuple"] = _hack_namedtuple
     collections.namedtuple.__code__ = namedtuple.__code__
     collections.namedtuple.__hijack = 1
 
-    # hack the cls already generated by namedtuple
-    # those created in other module can be pickled as normal,
+    # hack the cls already generated by namedtuple.
+    # Those created in other modules can be pickled as normal,
     # so only hack those in __main__ module
     for n, o in sys.modules["__main__"].__dict__.items():
         if (type(o) is type and o.__base__ is tuple
@@ -548,7 +571,18 @@ class PickleSerializer(FramedSerializer):
 class CloudPickleSerializer(PickleSerializer):
 
     def dumps(self, obj):
-        return cloudpickle.dumps(obj, 2)
+        try:
+            return cloudpickle.dumps(obj, 2)
+        except pickle.PickleError:
+            raise
+        except Exception as e:
+            emsg = _exception_message(e)
+            if "'i' format requires" in emsg:
+                msg = "Object too large to serialize: %s" % emsg
+            else:
+                msg = "Could not serialize object: %s: %s" % (e.__class__.__name__, emsg)
+            cloudpickle.print_exec(sys.stderr)
+            raise pickle.PicklingError(msg)
 
 
 class MarshalSerializer(FramedSerializer):
@@ -594,7 +628,7 @@ class AutoSerializer(FramedSerializer):
         elif _type == b'P':
             return pickle.loads(obj[1:])
         else:
-            raise ValueError("invalid sevialization type: %s" % _type)
+            raise ValueError("invalid serialization type: %s" % _type)
 
 
 class CompressedSerializer(FramedSerializer):
@@ -682,4 +716,4 @@ if __name__ == '__main__':
     import doctest
     (failure_count, test_count) = doctest.testmod()
     if failure_count:
-        exit(-1)
+        sys.exit(-1)

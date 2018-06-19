@@ -19,6 +19,7 @@ package org.apache.spark.sql
 
 import java.sql.{Date, Timestamp}
 
+import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile
 import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile.DEFAULT_PERCENTILE_ACCURACY
 import org.apache.spark.sql.catalyst.expressions.aggregate.ApproximatePercentile.PercentileDigest
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
@@ -49,6 +50,21 @@ class ApproximatePercentileQuerySuite extends QueryTest with SharedSQLContext {
              |FROM $table
            """.stripMargin),
         Row(250D, 500D, 750D, 1D, 1000D, 1D, 1000D)
+      )
+    }
+  }
+
+  test("percentile_approx, the first element satisfies small percentages") {
+    withTempView(table) {
+      (1 to 10).toDF("col").createOrReplaceTempView(table)
+      checkAnswer(
+        spark.sql(
+          s"""
+             |SELECT
+             |  percentile_approx(col, array(0.01, 0.1, 0.11))
+             |FROM $table
+           """.stripMargin),
+        Row(Seq(1, 1, 2))
       )
     }
   }
@@ -130,7 +146,7 @@ class ApproximatePercentileQuerySuite extends QueryTest with SharedSQLContext {
       (1 to 1000).toDF("col").createOrReplaceTempView(table)
       checkAnswer(
         spark.sql(s"SELECT percentile_approx(col, array(0.25 + 0.25D), 200 + 800D) FROM $table"),
-        Row(Seq(500D))
+        Row(Seq(499))
       )
     }
   }
@@ -263,5 +279,17 @@ class ApproximatePercentileQuerySuite extends QueryTest with SharedSQLContext {
 
       checkAnswer(query, expected)
     }
+  }
+
+  test("SPARK-24013: unneeded compress can cause performance issues with sorted input") {
+    val buffer = new PercentileDigest(1.0D / ApproximatePercentile.DEFAULT_PERCENTILE_ACCURACY)
+    var compressCounts = 0
+    (1 to 10000000).foreach { i =>
+      buffer.add(i)
+      if (buffer.isCompressed) compressCounts += 1
+    }
+    assert(compressCounts > 0)
+    buffer.quantileSummaries
+    assert(buffer.isCompressed)
   }
 }

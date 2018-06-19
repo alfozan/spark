@@ -73,18 +73,22 @@ statement
     | ALTER DATABASE identifier SET DBPROPERTIES tablePropertyList     #setDatabaseProperties
     | DROP DATABASE (IF EXISTS)? identifier (RESTRICT | CASCADE)?      #dropDatabase
     | createTableHeader ('(' colTypeList ')')? tableProvider
-        (OPTIONS options=tablePropertyList)?
-        (PARTITIONED BY partitionColumnNames=identifierList)?
-        bucketSpec? locationSpec?
-        (COMMENT comment=STRING)?
-        (TBLPROPERTIES tableProps=tablePropertyList)?
+        ((OPTIONS options=tablePropertyList) |
+        (PARTITIONED BY partitionColumnNames=identifierList) |
+        bucketSpec |
+        locationSpec |
+        (COMMENT comment=STRING) |
+        (TBLPROPERTIES tableProps=tablePropertyList))*
         (AS? query)?                                                   #createTable
     | createTableHeader ('(' columns=colTypeList ')')?
-        (COMMENT comment=STRING)?
-        (PARTITIONED BY '(' partitionColumns=colTypeList ')')?
-        bucketSpec? skewSpec?
-        rowFormat?  createFileFormat? locationSpec?
-        (TBLPROPERTIES tablePropertyList)?
+        ((COMMENT comment=STRING) |
+        (PARTITIONED BY '(' partitionColumns=colTypeList ')') |
+        bucketSpec |
+        skewSpec |
+        rowFormat |
+        createFileFormat |
+        locationSpec |
+        (TBLPROPERTIES tableProps=tablePropertyList))*
         (AS? query)?                                                   #createHiveTable
     | CREATE TABLE (IF NOT EXISTS)? target=tableIdentifier
         LIKE source=tableIdentifier locationSpec?                      #createTableLike
@@ -137,7 +141,7 @@ statement
         (LIKE? pattern=STRING)?                                        #showTables
     | SHOW TABLE EXTENDED ((FROM | IN) db=identifier)?
         LIKE pattern=STRING partitionSpec?                             #showTable
-    | SHOW DATABASES (LIKE pattern=STRING)?                            #showDatabases
+    | SHOW DATABASES (LIKE? pattern=STRING)?                           #showDatabases
     | SHOW TBLPROPERTIES table=tableIdentifier
         ('(' key=tablePropertyKey ')')?                                #showTblProperties
     | SHOW COLUMNS (FROM | IN) tableIdentifier
@@ -394,7 +398,7 @@ hintStatement
     ;
 
 fromClause
-    : FROM relation (',' relation)* lateralView*
+    : FROM relation (',' relation)* lateralView* pivotClause?
     ;
 
 aggregation
@@ -407,6 +411,10 @@ aggregation
 groupingSet
     : '(' (expression (',' expression)*)? ')'
     | expression
+    ;
+
+pivotClause
+    : PIVOT '(' aggregates=namedExpressionSeq FOR pivotColumn=identifier IN '(' pivotValues+=constant (',' pivotValues+=constant)* ')' ')'
     ;
 
 lateralView
@@ -564,8 +572,7 @@ valueExpression
     ;
 
 primaryExpression
-    : name=(CURRENT_DATE | CURRENT_TIMESTAMP)                                                  #timeFunctionCall
-    | CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
+    : CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
     | CASE value=expression whenClause+ (ELSE elseExpression=expression)? END                  #simpleCase
     | CAST '(' expression AS dataType ')'                                                      #cast
     | STRUCT '(' (argument+=namedExpression (',' argument+=namedExpression)*)? ')'             #struct
@@ -585,6 +592,7 @@ primaryExpression
     | identifier                                                                               #columnReference
     | base=primaryExpression '.' fieldName=identifier                                          #dereference
     | '(' expression ')'                                                                       #parenthesizedExpression
+    | EXTRACT '(' field=identifier FROM source=valueExpression ')'                             #extract
     ;
 
 constant
@@ -722,7 +730,7 @@ nonReserved
     | ADD
     | OVER | PARTITION | RANGE | ROWS | PRECEDING | FOLLOWING | CURRENT | ROW | LAST | FIRST | AFTER
     | MAP | ARRAY | STRUCT
-    | LATERAL | WINDOW | REDUCE | TRANSFORM | SERDE | SERDEPROPERTIES | RECORDREADER
+    | PIVOT | LATERAL | WINDOW | REDUCE | TRANSFORM | SERDE | SERDEPROPERTIES | RECORDREADER
     | DELIMITED | FIELDS | TERMINATED | COLLECTION | ITEMS | KEYS | ESCAPED | LINES | SEPARATED
     | EXTENDED | REFRESH | CLEAR | CACHE | UNCACHE | LAZY | GLOBAL | TEMPORARY | OPTIONS
     | GROUPING | CUBE | ROLLUP
@@ -732,6 +740,7 @@ nonReserved
     | VIEW | REPLACE
     | IF
     | POSITION
+    | EXTRACT
     | NO | DATA
     | START | TRANSACTION | COMMIT | ROLLBACK | IGNORE
     | SORT | CLUSTER | DISTRIBUTE | UNSET | TBLPROPERTIES | SKEWED | STORED | DIRECTORIES | LOCATION
@@ -742,12 +751,12 @@ nonReserved
     | REVOKE | GRANT | LOCK | UNLOCK | MSCK | REPAIR | RECOVER | EXPORT | IMPORT | LOAD | VALUES | COMMENT | ROLE
     | ROLES | COMPACTIONS | PRINCIPALS | TRANSACTIONS | INDEX | INDEXES | LOCKS | OPTION | LOCAL | INPATH
     | ASC | DESC | LIMIT | RENAME | SETS
-    | AT | NULLS | OVERWRITE | ALL | ALTER | AS | BETWEEN | BY | CREATE | DELETE
+    | AT | NULLS | OVERWRITE | ALL | ANY | ALTER | AS | BETWEEN | BY | CREATE | DELETE
     | DESCRIBE | DROP | EXISTS | FALSE | FOR | GROUP | IN | INSERT | INTO | IS |LIKE
     | NULL | ORDER | OUTER | TABLE | TRUE | WITH | RLIKE
     | AND | CASE | CAST | DISTINCT | DIV | ELSE | END | FUNCTION | INTERVAL | MACRO | OR | STRATIFY | THEN
     | UNBOUNDED | WHEN
-    | DATABASE | SELECT | FROM | WHERE | HAVING | TO | TABLE | WITH | NOT | CURRENT_DATE | CURRENT_TIMESTAMP
+    | DATABASE | SELECT | FROM | WHERE | HAVING | TO | TABLE | WITH | NOT
     | DIRECTORY
     | BOTH | LEADING | TRAILING
     ;
@@ -757,6 +766,7 @@ FROM: 'FROM';
 ADD: 'ADD';
 AS: 'AS';
 ALL: 'ALL';
+ANY: 'ANY';
 DISTINCT: 'DISTINCT';
 WHERE: 'WHERE';
 GROUP: 'GROUP';
@@ -802,6 +812,7 @@ RIGHT: 'RIGHT';
 FULL: 'FULL';
 NATURAL: 'NATURAL';
 ON: 'ON';
+PIVOT: 'PIVOT';
 LATERAL: 'LATERAL';
 WINDOW: 'WINDOW';
 OVER: 'OVER';
@@ -869,6 +880,7 @@ TRAILING: 'TRAILING';
 
 IF: 'IF';
 POSITION: 'POSITION';
+EXTRACT: 'EXTRACT';
 
 EQ  : '=' | '==';
 NSEQ: '<=>';
@@ -983,8 +995,6 @@ OPTION: 'OPTION';
 ANTI: 'ANTI';
 LOCAL: 'LOCAL';
 INPATH: 'INPATH';
-CURRENT_DATE: 'CURRENT_DATE';
-CURRENT_TIMESTAMP: 'CURRENT_TIMESTAMP';
 
 STRING
     : '\'' ( ~('\''|'\\') | ('\\' .) )* '\''
