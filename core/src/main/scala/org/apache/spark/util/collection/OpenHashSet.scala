@@ -28,9 +28,9 @@ import org.apache.spark.annotation.Private
  * removed.
  *
  * The underlying implementation uses Scala compiler's specialization to generate optimized
- * storage for two primitive types (Long and Int). It is much faster than Java's standard HashSet
- * while incurring much less memory overhead. This can serve as building blocks for higher level
- * data structures such as an optimized HashMap.
+ * storage for four primitive types (Long, Int, Double, and Float). It is much faster than Java's
+ * standard HashSet while incurring much less memory overhead. This can serve as building blocks
+ * for higher level data structures such as an optimized HashMap.
  *
  * This OpenHashSet is designed to serve as building blocks for higher level data structures
  * such as an optimized hash map. Compared with standard hash set implementations, this class
@@ -41,7 +41,7 @@ import org.apache.spark.annotation.Private
  * to explore all spaces for each key (see http://en.wikipedia.org/wiki/Quadratic_probing).
  */
 @Private
-class OpenHashSet[@specialized(Long, Int) T: ClassTag](
+class OpenHashSet[@specialized(Long, Int, Double, Float) T: ClassTag](
     initialCapacity: Int,
     loadFactor: Double)
   extends Serializable {
@@ -62,24 +62,12 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
   // specialization to work (specialized class extends the non-specialized one and needs access
   // to the "private" variables).
 
-  protected val hasher: Hasher[T] = {
-    // It would've been more natural to write the following using pattern matching. But Scala 2.9.x
-    // compiler has a bug when specialization is used together with this pattern matching, and
-    // throws:
-    // scala.tools.nsc.symtab.Types$TypeError: type mismatch;
-    //  found   : scala.reflect.AnyValManifest[Long]
-    //  required: scala.reflect.ClassTag[Int]
-    //         at scala.tools.nsc.typechecker.Contexts$Context.error(Contexts.scala:298)
-    //         at scala.tools.nsc.typechecker.Infer$Inferencer.error(Infer.scala:207)
-    //         ...
-    val mt = classTag[T]
-    if (mt == ClassTag.Long) {
-      (new LongHasher).asInstanceOf[Hasher[T]]
-    } else if (mt == ClassTag.Int) {
-      (new IntHasher).asInstanceOf[Hasher[T]]
-    } else {
-      new Hasher[T]
-    }
+  protected val hasher: Hasher[T] = classTag[T] match {
+    case ClassTag.Long => new LongHasher().asInstanceOf[Hasher[T]]
+    case ClassTag.Int => new IntHasher().asInstanceOf[Hasher[T]]
+    case ClassTag.Double => new DoubleHasher().asInstanceOf[Hasher[T]]
+    case ClassTag.Float => new FloatHasher().asInstanceOf[Hasher[T]]
+    case _ => new Hasher[T]
   }
 
   protected var _capacity = nextPowerOf2(initialCapacity)
@@ -109,7 +97,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * Add an element to the set. If the set is over capacity after the insertion, grow the set
    * and rehash all elements.
    */
-  def add(k: T) {
+  def add(k: T): Unit = {
     addWithoutResize(k)
     rehashIfNeeded(k, grow, move)
   }
@@ -121,6 +109,17 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
     }
     this
   }
+
+  /**
+   * Check if a key exists at the provided position using object equality rather than
+   * cooperative equality. Otherwise, hash sets will mishandle values for which `==`
+   * and `equals` return different results, like 0.0/-0.0 and NaN/NaN.
+   *
+   * See: https://issues.apache.org/jira/browse/SPARK-45599
+   */
+  @annotation.nowarn("cat=other-non-cooperative-equals")
+  private def keyExistsAtPos(k: T, pos: Int) =
+    _data(pos) equals k
 
   /**
    * Add an element to the set. This one differs from add in that it doesn't trigger rehashing.
@@ -142,8 +141,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
         _bitset.set(pos)
         _size += 1
         return pos | NONEXISTENCE_MASK
-      } else if (_data(pos) == k) {
-        // Found an existing key.
+      } else if (keyExistsAtPos(k, pos)) {
         return pos
       } else {
         // quadratic probing with values increase by 1, 2, 3, ...
@@ -162,7 +160,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * @param moveFunc Callback invoked when we move the key from one position (in the old data array)
    *                 to a new position (in the new data array).
    */
-  def rehashIfNeeded(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit) {
+  def rehashIfNeeded(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit = {
     if (_size > _growThreshold) {
       rehash(k, allocateFunc, moveFunc)
     }
@@ -177,7 +175,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
     while (true) {
       if (!_bitset.get(pos)) {
         return INVALID_POS
-      } else if (k == _data(pos)) {
+      } else if (keyExistsAtPos(k, pos)) {
         return pos
       } else {
         // quadratic probing with values increase by 1, 2, 3, ...
@@ -223,7 +221,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
    * @param moveFunc Callback invoked when we move the key from one position (in the old data array)
    *                 to a new position (in the new data array).
    */
-  private def rehash(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit) {
+  private def rehash(k: T, allocateFunc: (Int) => Unit, moveFunc: (Int, Int) => Unit): Unit = {
     val newCapacity = _capacity * 2
     require(newCapacity > 0 && newCapacity <= OpenHashSet.MAX_CAPACITY,
       s"Can't contain more than ${(loadFactor * OpenHashSet.MAX_CAPACITY).toInt} elements")
@@ -268,7 +266,7 @@ class OpenHashSet[@specialized(Long, Int) T: ClassTag](
   /**
    * Re-hash a value to deal better with hash functions that don't differ in the lower bits.
    */
-  private def hashcode(h: Int): Int = Hashing.murmur3_32().hashInt(h).asInt()
+  private def hashcode(h: Int): Int = Hashing.murmur3_32_fixed().hashInt(h).asInt()
 
   private def nextPowerOf2(n: Int): Int = {
     if (n == 0) {
@@ -293,7 +291,7 @@ object OpenHashSet {
    * A set of specialized hash function implementation to avoid boxing hash code computation
    * in the specialized implementation of OpenHashSet.
    */
-  sealed class Hasher[@specialized(Long, Int) T] extends Serializable {
+  sealed class Hasher[@specialized(Long, Int, Double, Float) T] extends Serializable {
     def hash(o: T): Int = o.hashCode()
   }
 
@@ -305,8 +303,19 @@ object OpenHashSet {
     override def hash(o: Int): Int = o
   }
 
-  private def grow1(newSize: Int) {}
-  private def move1(oldPos: Int, newPos: Int) { }
+  class DoubleHasher extends Hasher[Double] {
+    override def hash(o: Double): Int = {
+      val bits = java.lang.Double.doubleToLongBits(o)
+      (bits ^ (bits >>> 32)).toInt
+    }
+  }
+
+  class FloatHasher extends Hasher[Float] {
+    override def hash(o: Float): Int = java.lang.Float.floatToIntBits(o)
+  }
+
+  private def grow1(newSize: Int): Unit = {}
+  private def move1(oldPos: Int, newPos: Int): Unit = { }
 
   private val grow = grow1 _
   private val move = move1 _

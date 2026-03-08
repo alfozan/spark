@@ -17,27 +17,25 @@
 
 package org.apache.spark.sql.util
 
-import java.util.concurrent.locks.ReentrantReadWriteLock
+import scala.jdk.CollectionConverters._
 
-import scala.collection.mutable.ListBuffer
-import scala.util.control.NonFatal
-
-import org.apache.spark.SparkConf
-import org.apache.spark.annotation.{DeveloperApi, Experimental, InterfaceStability}
+import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.Logging
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.sql.classic.SparkSession
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf._
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{ListenerBus, Utils}
 
 /**
- * :: Experimental ::
  * The interface of query execution listener that can be used to analyze execution metrics.
  *
  * @note Implementations should guarantee thread-safety as they can be invoked by
  * multiple different threads.
  */
-@Experimental
-@InterfaceStability.Evolving
 trait QueryExecutionListener {
 
   /**
@@ -59,8 +57,9 @@ trait QueryExecutionListener {
    * @param funcName the name of the action that triggered this query.
    * @param qe the QueryExecution object that carries detail information like logical plan,
    *           physical plan, etc.
-   * @param exception the exception that failed this query.
-   *
+   * @param exception the exception that failed this query. If `java.lang.Error` is thrown during
+   *                  execution, it will be wrapped with an `Exception` and it can be accessed by
+   *                  `exception.getCause`.
    * @note This can be invoked by multiple different threads.
    */
   @DeveloperApi
@@ -69,18 +68,30 @@ trait QueryExecutionListener {
 
 
 /**
- * :: Experimental ::
- *
  * Manager for [[QueryExecutionListener]]. See `org.apache.spark.sql.SQLContext.listenerManager`.
  */
-@Experimental
-@InterfaceStability.Evolving
-class ExecutionListenerManager private extends Logging {
+// The `session` is used to indicate which session carries this listener manager, and we only
+// catch SQL executions which are launched by the same session.
+// The `loadExtensions` flag is used to indicate whether we should load the pre-defined,
+// user-specified listeners during construction. We should not do it when cloning this listener
+// manager, as we will copy all listeners to the cloned listener manager.
+class ExecutionListenerManager private[sql](
+    session: SparkSession,
+    sqlConf: SQLConf,
+    loadExtensions: Boolean)
+  extends Logging {
 
-  private[sql] def this(conf: SparkConf) = {
-    this()
+  // SPARK-39864: lazily create the listener bus on the first register() call in order to
+  // avoid listener overheads when QueryExecutionListeners aren't used:
+  private val listenerBusInitializationLock = new Object()
+  @volatile private var listenerBus: Option[ExecutionListenerBus] = None
+
+  if (loadExtensions) {
+    val conf = session.sparkContext.conf
     conf.get(QUERY_EXECUTION_LISTENERS).foreach { classNames =>
-      Utils.loadExtensions(classOf[QueryExecutionListener], classNames, conf).foreach(register)
+      SQLConf.withExistingConf(sqlConf) {
+        Utils.loadExtensions(classOf[QueryExecutionListener], classNames, conf).foreach(register)
+      }
     }
   }
 
@@ -88,82 +99,85 @@ class ExecutionListenerManager private extends Logging {
    * Registers the specified [[QueryExecutionListener]].
    */
   @DeveloperApi
-  def register(listener: QueryExecutionListener): Unit = writeLock {
-    listeners += listener
+  def register(listener: QueryExecutionListener): Unit = {
+    listenerBusInitializationLock.synchronized {
+      if (listenerBus.isEmpty) {
+        listenerBus = Some(new ExecutionListenerBus(this, session))
+      }
+    }
+    listenerBus.get.addListener(listener)
   }
 
   /**
    * Unregisters the specified [[QueryExecutionListener]].
    */
   @DeveloperApi
-  def unregister(listener: QueryExecutionListener): Unit = writeLock {
-    listeners -= listener
+  def unregister(listener: QueryExecutionListener): Unit = {
+    listenerBus.foreach(_.removeListener(listener))
   }
 
   /**
    * Removes all the registered [[QueryExecutionListener]].
    */
   @DeveloperApi
-  def clear(): Unit = writeLock {
-    listeners.clear()
+  def clear(): Unit = {
+    listenerBus.foreach(_.removeAllListeners())
+  }
+
+  /** Only exposed for testing. */
+  private[sql] def listListeners(): Array[QueryExecutionListener] = {
+    listenerBus.map(_.listeners.asScala.toArray).getOrElse(Array.empty[QueryExecutionListener])
   }
 
   /**
    * Get an identical copy of this listener manager.
    */
-  @DeveloperApi
-  override def clone(): ExecutionListenerManager = writeLock {
-    val newListenerManager = new ExecutionListenerManager
-    listeners.foreach(newListenerManager.register)
+  private[sql] def clone(session: SparkSession, sqlConf: SQLConf): ExecutionListenerManager = {
+    val newListenerManager =
+      new ExecutionListenerManager(session, sqlConf, loadExtensions = false)
+    listenerBus.foreach(_.listeners.asScala.foreach(newListenerManager.register))
     newListenerManager
   }
+}
 
-  private[sql] def onSuccess(funcName: String, qe: QueryExecution, duration: Long): Unit = {
-    readLock {
-      withErrorHandling { listener =>
-        listener.onSuccess(funcName, qe, duration)
+private[sql] class ExecutionListenerBus private(sessionUUID: String)
+  extends SparkListener with ListenerBus[QueryExecutionListener, SparkListenerSQLExecutionEnd] {
+
+  def this(manager: ExecutionListenerManager, session: SparkSession) = {
+    this(session.sessionUUID)
+    session.sparkContext.listenerBus.addToSharedQueue(this)
+    session.sparkContext.cleaner.foreach { cleaner =>
+      cleaner.registerSparkListenerForCleanup(manager, this)
+    }
+  }
+
+  override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+    case e: SparkListenerSQLExecutionEnd => postToAll(e)
+    case _ =>
+  }
+
+  override protected def doPostEvent(
+      listener: QueryExecutionListener,
+      event: SparkListenerSQLExecutionEnd): Unit = {
+    if (shouldReport(event)) {
+      val funcName = event.executionName.get
+      event.executionFailure match {
+        case Some(ex) =>
+          val exception = ex match {
+            case e: Exception => e
+            case other: Throwable =>
+              QueryExecutionErrors.failedToExecuteQueryError(other)
+          }
+          listener.onFailure(funcName, event.qe, exception)
+        case _ =>
+          listener.onSuccess(funcName, event.qe, event.duration)
       }
     }
   }
 
-  private[sql] def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
-    readLock {
-      withErrorHandling { listener =>
-        listener.onFailure(funcName, qe, exception)
-      }
-    }
-  }
-
-  private[this] val listeners = ListBuffer.empty[QueryExecutionListener]
-
-  /** A lock to prevent updating the list of listeners while we are traversing through them. */
-  private[this] val lock = new ReentrantReadWriteLock()
-
-  private def withErrorHandling(f: QueryExecutionListener => Unit): Unit = {
-    for (listener <- listeners) {
-      try {
-        f(listener)
-      } catch {
-        case NonFatal(e) => logWarning("Error executing query execution listener", e)
-      }
-    }
-  }
-
-  /** Acquires a read lock on the cache for the duration of `f`. */
-  private def readLock[A](f: => A): A = {
-    val rl = lock.readLock()
-    rl.lock()
-    try f finally {
-      rl.unlock()
-    }
-  }
-
-  /** Acquires a write lock on the cache for the duration of `f`. */
-  private def writeLock[A](f: => A): A = {
-    val wl = lock.writeLock()
-    wl.lock()
-    try f finally {
-      wl.unlock()
-    }
+  private def shouldReport(e: SparkListenerSQLExecutionEnd): Boolean = {
+    // Only catch SQL execution with a name, and triggered by the same spark session that this
+    // listener manager belongs.
+    e.executionName.isDefined && e.qe.sparkSession.sessionUUID == sessionUUID
   }
 }

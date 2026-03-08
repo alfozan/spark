@@ -19,15 +19,14 @@ package org.apache.spark.network;
 
 import java.util.List;
 
-import com.google.common.primitives.Ints;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.FileRegion;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.MessageToMessageEncoder;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import org.apache.spark.network.protocol.ChunkFetchFailure;
 import org.apache.spark.network.protocol.ChunkFetchRequest;
@@ -44,6 +43,7 @@ import org.apache.spark.network.protocol.StreamFailure;
 import org.apache.spark.network.protocol.StreamRequest;
 import org.apache.spark.network.protocol.StreamResponse;
 import org.apache.spark.network.util.ByteArrayWritableChannel;
+import org.apache.spark.network.util.JavaUtils;
 import org.apache.spark.network.util.NettyUtils;
 
 public class ProtocolSuite {
@@ -115,9 +115,10 @@ public class ProtocolSuite {
     public void encode(ChannelHandlerContext ctx, FileRegion in, List<Object> out)
       throws Exception {
 
-      ByteArrayWritableChannel channel = new ByteArrayWritableChannel(Ints.checkedCast(in.count()));
-      while (in.transfered() < in.count()) {
-        in.transferTo(channel, in.transfered());
+      ByteArrayWritableChannel channel =
+        new ByteArrayWritableChannel(JavaUtils.checkedCast(in.count()));
+      while (in.transferred() < in.count()) {
+        in.transferTo(channel, in.transferred());
       }
       out.add(Unpooled.wrappedBuffer(channel.getData()));
     }

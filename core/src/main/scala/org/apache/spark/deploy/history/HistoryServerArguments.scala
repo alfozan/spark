@@ -21,6 +21,7 @@ import scala.annotation.tailrec
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.{ConfigEntry, History}
 import org.apache.spark.util.Utils
 
 /**
@@ -34,73 +35,75 @@ private[history] class HistoryServerArguments(conf: SparkConf, args: Array[Strin
 
   @tailrec
   private def parse(args: List[String]): Unit = {
-    if (args.length == 1) {
-      setLogDirectory(args.head)
-    } else {
-      args match {
-        case ("--dir" | "-d") :: value :: tail =>
-          setLogDirectory(value)
-          parse(tail)
+    args match {
+      case ("--help" | "-h") :: tail =>
+        printUsageAndExit(0)
 
-        case ("--help" | "-h") :: tail =>
-          printUsageAndExit(0)
+      case ("--properties-file") :: value :: tail =>
+        propertiesFile = value
+        parse(tail)
 
-        case ("--properties-file") :: value :: tail =>
-          propertiesFile = value
-          parse(tail)
+      case Nil =>
 
-        case Nil =>
-
-        case _ =>
-          printUsageAndExit(1)
-      }
+      case other =>
+        val errorMsg = s"Unrecognized options: ${other.mkString(" ")}\n"
+        printUsageAndExit(1, errorMsg)
     }
   }
 
-  private def setLogDirectory(value: String): Unit = {
-    logWarning("Setting log directory through the command line is deprecated as of " +
-      "Spark 1.1.0. Please set this through spark.history.fs.logDirectory instead.")
-    conf.set("spark.history.fs.logDirectory", value)
-  }
+  // This mutates the SparkConf, so all accesses to it must be made after this line
+  Utils.loadDefaultSparkProperties(conf, propertiesFile)
+  // Initialize logging system again after `spark.log.structuredLogging.enabled` takes effect
+  Utils.resetStructuredLogging(conf)
+  Logging.uninitialize()
 
-   // This mutates the SparkConf, so all accesses to it must be made after this line
-   Utils.loadDefaultSparkProperties(conf, propertiesFile)
+  // scalastyle:off line.size.limit println
+  private def printUsageAndExit(exitCode: Int, error: String = ""): Unit = {
+    val configs = History.getClass.getDeclaredFields
+      .filter(f => classOf[ConfigEntry[_]].isAssignableFrom(f.getType))
+      .map { f =>
+        f.setAccessible(true)
+        f.get(History).asInstanceOf[ConfigEntry[_]]
+      }
+    val maxConfigLength = configs.map(_.key.length).max
+    val sb = new StringBuilder(
+      s"""
+         |${error}Usage: HistoryServer [options]
+         |
+         |Options:
+         |  ${"--properties-file FILE".padTo(maxConfigLength, ' ')} Path to a custom Spark properties file.
+         |  ${"".padTo(maxConfigLength, ' ')} Default is conf/spark-defaults.conf.
+         |
+         |Configuration options can be set by setting the corresponding JVM system property.
+         |History Server options are always available; additional options depend on the provider.
+         |
+         |""".stripMargin)
 
-  private def printUsageAndExit(exitCode: Int) {
-    // scalastyle:off println
-    System.err.println(
-      """
-      |Usage: HistoryServer [options]
-      |
-      |Options:
-      |  DIR                         Deprecated; set spark.history.fs.logDirectory directly
-      |  --dir DIR (-d DIR)          Deprecated; set spark.history.fs.logDirectory directly
-      |  --properties-file FILE      Path to a custom Spark properties file.
-      |                              Default is conf/spark-defaults.conf.
-      |
-      |Configuration options can be set by setting the corresponding JVM system property.
-      |History Server options are always available; additional options depend on the provider.
-      |
-      |History Server options:
-      |
-      |  spark.history.ui.port              Port where server will listen for connections
-      |                                     (default 18080)
-      |  spark.history.acls.enable          Whether to enable view acls for all applications
-      |                                     (default false)
-      |  spark.history.provider             Name of history provider class (defaults to
-      |                                     file system-based provider)
-      |  spark.history.retainedApplications Max number of application UIs to keep loaded in memory
-      |                                     (default 50)
-      |FsHistoryProvider options:
-      |
-      |  spark.history.fs.logDirectory      Directory where app logs are stored
-      |                                     (default: file:/tmp/spark-events)
-      |  spark.history.fs.updateInterval    How often to reload log data from storage
-      |                                     (in seconds, default: 10)
-      |""".stripMargin)
-    // scalastyle:on println
+    def printConfigs(configs: Array[ConfigEntry[_]]): Unit = {
+      configs.sortBy(_.key).foreach { conf =>
+        sb.append("  ").append(conf.key.padTo(maxConfigLength, ' '))
+        var currentDocLen = 0
+        val intention = "\n" + " ".repeat(maxConfigLength + 2)
+        conf.doc.split("\\s+").foreach { word =>
+          if (currentDocLen + word.length > 60) {
+            sb.append(intention).append(" ").append(word)
+            currentDocLen = word.length + 1
+          } else {
+            sb.append(" ").append(word)
+            currentDocLen += word.length + 1
+          }
+        }
+        sb.append(intention).append(" (Default: ").append(conf.defaultValueString).append(")\n")
+      }
+    }
+    val (common, fs) = configs.partition(!_.key.startsWith("spark.history.fs."))
+    sb.append("History Server options:\n")
+    printConfigs(common)
+    sb.append("FsHistoryProvider options:\n")
+    printConfigs(fs)
+    System.err.println(sb.toString())
+    // scalastyle:on line.size.limit println
     System.exit(exitCode)
   }
-
 }
 

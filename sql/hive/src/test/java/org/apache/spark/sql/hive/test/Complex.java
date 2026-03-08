@@ -16,7 +16,7 @@
  */
 package org.apache.spark.sql.hive.test;
 
-import org.apache.commons.lang.builder.HashCodeBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.thrift.scheme.IScheme;
 import org.apache.thrift.scheme.SchemeFactory;
 import org.apache.thrift.scheme.StandardScheme;
@@ -548,7 +548,7 @@ public class Complex implements org.apache.thrift.TBase<Complex, Complex._Fields
       return false;
     }
     if (that instanceof Complex) {
-      return this.equals((Complex)that);
+      return this.equals((Complex) that);
     }
     return false;
   }
@@ -676,7 +676,7 @@ public class Complex implements org.apache.thrift.TBase<Complex, Complex._Fields
     }
 
     int lastComparison = 0;
-    Complex typedOther = (Complex)other;
+    Complex typedOther = other;
 
     lastComparison = Boolean.valueOf(isSetAint()).compareTo(typedOther.isSetAint());
     if (lastComparison != 0) {

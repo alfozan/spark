@@ -17,13 +17,13 @@
 
 package org.apache.spark.rdd
 
+import java.util.Objects
 import java.util.concurrent.atomic.AtomicInteger
 
 import com.fasterxml.jackson.annotation.{JsonIgnore, JsonInclude, JsonPropertyOrder}
 import com.fasterxml.jackson.annotation.JsonInclude.Include
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
-import com.google.common.base.Objects
 
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
@@ -41,7 +41,7 @@ import org.apache.spark.internal.Logging
  * There is no particular relationship between an operation scope and a stage or a job.
  * A scope may live inside one stage (e.g. map) or span across multiple jobs (e.g. take).
  */
-@JsonInclude(Include.NON_NULL)
+@JsonInclude(Include.NON_ABSENT)
 @JsonPropertyOrder(Array("id", "name", "parent"))
 private[spark] class RDDOperationScope(
     val name: String,
@@ -69,7 +69,7 @@ private[spark] class RDDOperationScope(
     }
   }
 
-  override def hashCode(): Int = Objects.hashCode(id, name, parent)
+  override def hashCode(): Int = Objects.hash(id, name, parent)
 
   override def toString: String = toJson
 }

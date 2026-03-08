@@ -17,18 +17,18 @@
 package org.apache.spark.status.api.v1
 
 import java.util.zip.ZipOutputStream
-import javax.servlet.ServletContext
-import javax.servlet.http.HttpServletRequest
-import javax.ws.rs._
-import javax.ws.rs.core.{Context, Response}
 
+import jakarta.servlet.ServletContext
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.ws.rs._
+import jakarta.ws.rs.core.{Context, Response}
+import org.eclipse.jetty.ee10.servlet.{ServletContextHandler, ServletHolder}
 import org.eclipse.jetty.server.handler.ContextHandler
-import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
 import org.glassfish.jersey.server.ServerProperties
 import org.glassfish.jersey.servlet.ServletContainer
 
 import org.apache.spark.SecurityManager
-import org.apache.spark.ui.SparkUI
+import org.apache.spark.ui.{SparkUI, UIUtils}
 
 /**
  * Main entry point for serving spark application metrics as json, using JAX-RS.
@@ -77,16 +77,20 @@ private[spark] trait UIRoot {
   /**
    * Runs some code with the current SparkUI instance for the app / attempt.
    *
-   * @throws NoSuchElementException If the app / attempt pair does not exist.
+   * @throws java.util.NoSuchElementException If the app / attempt pair does not exist.
    */
   def withSparkUI[T](appId: String, attemptId: Option[String])(fn: SparkUI => T): T
 
   def getApplicationInfoList: Iterator[ApplicationInfo]
+
+  def getApplicationInfoList(max: Int)(
+      filter: ApplicationInfo => Boolean): Iterator[ApplicationInfo]
+
   def getApplicationInfo(appId: String): Option[ApplicationInfo]
 
   /**
-   * Write the event logs for the given app to the [[ZipOutputStream]] instance. If attemptId is
-   * [[None]], event logs for all attempts of this application will be written out.
+   * Write the event logs for the given app to the `ZipOutputStream` instance. If attemptId is
+   * `None`, event logs for all attempts of this application will be written out.
    */
   def writeEventLogs(appId: String, attemptId: Option[String], zipStream: ZipOutputStream): Unit = {
     Response.serverError()
@@ -95,6 +99,8 @@ private[spark] trait UIRoot {
       .build()
   }
   def securityManager: SecurityManager
+
+  def checkUIViewPermissions(appId: String, attemptId: Option[String], user: String): Boolean
 }
 
 private[v1] object UIRootFromServletContext {
@@ -145,41 +151,34 @@ private[v1] trait BaseAppResource extends ApiRequestContext {
         throw new NotFoundException(s"no such app: $appKey")
     }
   }
+
+  protected def checkUIViewPermissions(): Unit = {
+    try {
+      val user = httpRequest.getRemoteUser()
+      if (!uiRoot.checkUIViewPermissions(appId, Option(attemptId), user)) {
+        throw new ForbiddenException(raw"""user "$user" is not authorized""")
+      }
+    } catch {
+      case _: NoSuchElementException =>
+        val appKey = Option(attemptId).map(appId + "/" + _).getOrElse(appId)
+        throw new NotFoundException(s"no such app: $appKey")
+    }
+  }
 }
 
 private[v1] class ForbiddenException(msg: String) extends WebApplicationException(
-  Response.status(Response.Status.FORBIDDEN).entity(msg).build())
+    UIUtils.buildErrorResponse(Response.Status.FORBIDDEN, msg))
 
 private[v1] class NotFoundException(msg: String) extends WebApplicationException(
-  new NoSuchElementException(msg),
-    Response
-      .status(Response.Status.NOT_FOUND)
-      .entity(ErrorWrapper(msg))
-      .build()
-)
+    UIUtils.buildErrorResponse(Response.Status.NOT_FOUND, msg))
 
 private[v1] class ServiceUnavailable(msg: String) extends WebApplicationException(
-  new ServiceUnavailableException(msg),
-  Response
-    .status(Response.Status.SERVICE_UNAVAILABLE)
-    .entity(ErrorWrapper(msg))
-    .build()
-)
+    UIUtils.buildErrorResponse(Response.Status.SERVICE_UNAVAILABLE, msg))
 
 private[v1] class BadParameterException(msg: String) extends WebApplicationException(
-  new IllegalArgumentException(msg),
-  Response
-    .status(Response.Status.BAD_REQUEST)
-    .entity(ErrorWrapper(msg))
-    .build()
-) {
+    UIUtils.buildErrorResponse(Response.Status.BAD_REQUEST, msg)) {
   def this(param: String, exp: String, actual: String) = {
     this(raw"""Bad value for parameter "$param".  Expected a $exp, got "$actual"""")
   }
 }
 
-/**
- * Signal to JacksonMessageWriter to not convert the message into json (which would result in an
- * extra set of quotes).
- */
-private[v1] case class ErrorWrapper(s: String)

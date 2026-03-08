@@ -17,8 +17,9 @@
 
 package org.apache.spark.deploy.yarn
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.client.api.AMRMClient
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest
@@ -29,6 +30,7 @@ import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.deploy.yarn.config._
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEndpointRef
+import org.apache.spark.util.Utils
 
 /**
  * Handles registering and unregistering the application with the YARN ResourceManager.
@@ -75,13 +77,14 @@ private[spark] class YarnRMClient extends Logging {
   def createAllocator(
       conf: YarnConfiguration,
       sparkConf: SparkConf,
+      appAttemptId: ApplicationAttemptId,
       driverUrl: String,
       driverRef: RpcEndpointRef,
       securityMgr: SecurityManager,
       localResources: Map[String, LocalResource]): YarnAllocator = {
     require(registered, "Must register AM before creating allocator.")
-    new YarnAllocator(driverUrl, driverRef, conf, sparkConf, amClient, getAttemptId(), securityMgr,
-      localResources, new SparkRackResolver())
+    new YarnAllocator(driverUrl, driverRef, conf, sparkConf, amClient, appAttemptId, securityMgr,
+      localResources, SparkRackResolver.get(conf))
   }
 
   /**
@@ -99,25 +102,29 @@ private[spark] class YarnRMClient extends Logging {
     }
   }
 
-  /** Returns the attempt ID. */
-  def getAttemptId(): ApplicationAttemptId = {
-    YarnSparkHadoopUtil.getContainerId.getApplicationAttemptId()
-  }
-
   /** Returns the configuration for the AmIpFilter to add to the Spark UI. */
   def getAmIpFilterParams(conf: YarnConfiguration, proxyBase: String): Map[String, String] = {
     // Figure out which scheme Yarn is using. Note the method seems to have been added after 2.2,
     // so not all stable releases have it.
     val prefix = WebAppUtils.getHttpSchemePrefix(conf)
     val proxies = WebAppUtils.getProxyHostsAndPortsForAmFilter(conf)
-    val hosts = proxies.asScala.map(_.split(":").head)
+    val hosts = proxies.asScala.map(proxy => Utils.parseHostPort(proxy)._1)
     val uriBases = proxies.asScala.map { proxy => prefix + proxy + proxyBase }
-    Map("PROXY_HOSTS" -> hosts.mkString(","), "PROXY_URI_BASES" -> uriBases.mkString(","))
+    val params =
+      Map("PROXY_HOSTS" -> hosts.mkString(","), "PROXY_URI_BASES" -> uriBases.mkString(","))
+
+    // Handles RM HA urls
+    val rmIds = conf.getStringCollection(YarnConfiguration.RM_HA_IDS).asScala
+    if (rmIds != null && rmIds.nonEmpty) {
+      params + ("RM_HA_URLS" -> rmIds.map(getUrlByRmId(conf, _)).mkString(","))
+    } else {
+      params
+    }
   }
 
   /** Returns the maximum number of attempts to register the AM. */
   def getMaxRegAttempts(sparkConf: SparkConf, yarnConf: YarnConfiguration): Int = {
-    val sparkMaxAttempts = sparkConf.get(MAX_APP_ATTEMPTS).map(_.toInt)
+    val sparkMaxAttempts = sparkConf.get(MAX_APP_ATTEMPTS)
     val yarnMaxAttempts = yarnConf.getInt(
       YarnConfiguration.RM_AM_MAX_ATTEMPTS, YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS)
     sparkMaxAttempts match {
@@ -126,4 +133,21 @@ private[spark] class YarnRMClient extends Logging {
     }
   }
 
+  private def getUrlByRmId(conf: Configuration, rmId: String): String = {
+    val addressPropertyPrefix = if (YarnConfiguration.useHttps(conf)) {
+      YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS
+    } else {
+      YarnConfiguration.RM_WEBAPP_ADDRESS
+    }
+
+    val addressWithRmId = if (rmId == null || rmId.isEmpty) {
+      addressPropertyPrefix
+    } else if (rmId.startsWith(".")) {
+      throw new IllegalStateException(s"rmId $rmId should not already have '.' prepended.")
+    } else {
+      s"$addressPropertyPrefix.$rmId"
+    }
+
+    conf.get(addressWithRmId)
+  }
 }

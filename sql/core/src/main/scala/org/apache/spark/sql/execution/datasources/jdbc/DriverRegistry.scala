@@ -20,7 +20,9 @@ package org.apache.spark.sql.execution.datasources.jdbc
 import java.sql.{Driver, DriverManager}
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 
+import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.Utils
 
@@ -50,12 +52,22 @@ object DriverRegistry extends Logging {
     } else {
       synchronized {
         if (wrapperMap.get(className).isEmpty) {
-          val wrapper = new DriverWrapper(cls.newInstance().asInstanceOf[Driver])
+          val wrapper = new DriverWrapper(cls.getConstructor().newInstance().asInstanceOf[Driver])
           DriverManager.registerDriver(wrapper)
           wrapperMap(className) = wrapper
           logTrace(s"Wrapper for $className registered")
         }
       }
+    }
+  }
+
+  def get(className: String): Driver = {
+    DriverManager.getDrivers.asScala.collectFirst {
+      case d: DriverWrapper if d.wrapped.getClass.getCanonicalName == className => d.wrapped
+      case d if d.getClass.getCanonicalName == className => d
+    }.getOrElse {
+      throw SparkException.internalError(
+        s"Did not find registered driver with class $className")
     }
   }
 }

@@ -17,14 +17,13 @@
 
 package org.apache.spark.ml.feature
 
-import scala.beans.BeanInfo
-
 import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest}
 import org.apache.spark.sql.{DataFrame, Row}
 
-
-@BeanInfo
-case class NGramTestData(inputTokens: Array[String], wantedNGrams: Array[String])
+case class NGramTestData(inputTokens: Array[String], wantedNGrams: Array[String]) {
+  def getInputTokens: Array[String] = inputTokens
+  def getWantedNGrams: Array[String] = wantedNGrams
+}
 
 class NGramSuite extends MLTest with DefaultReadWriteTest {
 
@@ -84,7 +83,7 @@ class NGramSuite extends MLTest with DefaultReadWriteTest {
 
   def testNGram(t: NGram, dataFrame: DataFrame): Unit = {
     testTransformer[(Seq[String], Seq[String])](dataFrame, t, "nGrams", "wantedNGrams") {
-      case Row(actualNGrams : Seq[_], wantedNGrams: Seq[_]) =>
+      case Row(actualNGrams : scala.collection.Seq[_], wantedNGrams: scala.collection.Seq[_]) =>
         assert(actualNGrams === wantedNGrams)
     }
   }

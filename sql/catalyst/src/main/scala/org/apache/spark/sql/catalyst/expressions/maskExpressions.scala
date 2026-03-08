@@ -17,553 +17,337 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.commons.codec.digest.DigestUtils
-
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.MaskExpressionsUtils._
-import org.apache.spark.sql.catalyst.expressions.MaskLike._
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
-import org.apache.spark.sql.types._
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.{ExpressionBuilder, TypeCheckResult}
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.plans.logical.{FunctionSignature, InputParameter}
+import org.apache.spark.sql.errors.QueryErrorsBase
+import org.apache.spark.sql.internal.types.StringTypeWithCollation
+import org.apache.spark.sql.types.{AbstractDataType, DataType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
-
-trait MaskLike {
-  def upper: String
-  def lower: String
-  def digit: String
-
-  protected lazy val upperReplacement: Int = getReplacementChar(upper, defaultMaskedUppercase)
-  protected lazy val lowerReplacement: Int = getReplacementChar(lower, defaultMaskedLowercase)
-  protected lazy val digitReplacement: Int = getReplacementChar(digit, defaultMaskedDigit)
-
-  protected val maskUtilsClassName: String = classOf[MaskExpressionsUtils].getName
-
-  def inputStringLengthCode(inputString: String, length: String): String = {
-    s"${CodeGenerator.JAVA_INT} $length = $inputString.codePointCount(0, $inputString.length());"
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage =
+    """_FUNC_(input[, upperChar, lowerChar, digitChar, otherChar]) - masks the given string value.
+       The function replaces characters with 'X' or 'x', and numbers with 'n'.
+       This can be useful for creating copies of tables with sensitive information removed.
+      """,
+  arguments = """
+    Arguments:
+      * input      - string value to mask. Supported types: STRING, VARCHAR, CHAR
+      * upperChar  - character to replace upper-case characters with. Specify NULL to retain original character. Default value: 'X'
+      * lowerChar  - character to replace lower-case characters with. Specify NULL to retain original character. Default value: 'x'
+      * digitChar  - character to replace digit characters with. Specify NULL to retain original character. Default value: 'n'
+      * otherChar  - character to replace all other characters with. Specify NULL to retain original character. Default value: NULL
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_('abcd-EFGH-8765-4321');
+        xxxx-XXXX-nnnn-nnnn
+      > SELECT _FUNC_('abcd-EFGH-8765-4321', 'Q');
+        xxxx-QQQQ-nnnn-nnnn
+      > SELECT _FUNC_('AbCD123-@$#', 'Q', 'q');
+        QqQQnnn-@$#
+      > SELECT _FUNC_('AbCD123-@$#');
+        XxXXnnn-@$#
+      > SELECT _FUNC_('AbCD123-@$#', 'Q');
+        QxQQnnn-@$#
+      > SELECT _FUNC_('AbCD123-@$#', 'Q', 'q');
+        QqQQnnn-@$#
+      > SELECT _FUNC_('AbCD123-@$#', 'Q', 'q', 'd');
+        QqQQddd-@$#
+      > SELECT _FUNC_('AbCD123-@$#', 'Q', 'q', 'd', 'o');
+        QqQQdddoooo
+      > SELECT _FUNC_('AbCD123-@$#', NULL, 'q', 'd', 'o');
+        AqCDdddoooo
+      > SELECT _FUNC_('AbCD123-@$#', NULL, NULL, 'd', 'o');
+        AbCDdddoooo
+      > SELECT _FUNC_('AbCD123-@$#', NULL, NULL, NULL, 'o');
+        AbCD123oooo
+      > SELECT _FUNC_(NULL, NULL, NULL, NULL, 'o');
+        NULL
+      > SELECT _FUNC_(NULL);
+        NULL
+      > SELECT _FUNC_('AbCD123-@$#', NULL, NULL, NULL, NULL);
+        AbCD123-@$#
+  """,
+  since = "3.4.0",
+  group = "string_funcs")
+// scalastyle:on line.size.limit
+object MaskExpressionBuilder extends ExpressionBuilder {
+  override def functionSignature: Option[FunctionSignature] = {
+    val strArg = InputParameter("str")
+    val upperCharArg = InputParameter("upperChar",
+      Some(Literal.create(Mask.MASKED_UPPERCASE, StringType)))
+    val lowerCharArg = InputParameter("lowerChar",
+      Some(Literal.create(Mask.MASKED_LOWERCASE, StringType)))
+    val digitCharArg = InputParameter("digitChar",
+      Some(Literal.create(Mask.MASKED_DIGIT, StringType)))
+    val otherCharArg = InputParameter("otherChar",
+      Some(Literal.create(Mask.MASKED_IGNORE, StringType)))
+    val functionSignature: FunctionSignature = FunctionSignature(Seq(
+      strArg, upperCharArg, lowerCharArg, digitCharArg, otherCharArg))
+    Some(functionSignature)
   }
 
-  def appendMaskedToStringBuilderCode(
-      ctx: CodegenContext,
-      sb: String,
-      inputString: String,
-      offset: String,
-      numChars: String): String = {
-    val i = ctx.freshName("i")
-    val codePoint = ctx.freshName("codePoint")
-    s"""
-       |for (${CodeGenerator.JAVA_INT} $i = 0; $i < $numChars; $i++) {
-       |  ${CodeGenerator.JAVA_INT} $codePoint = $inputString.codePointAt($offset);
-       |  $sb.appendCodePoint($maskUtilsClassName.transformChar($codePoint,
-       |    $upperReplacement, $lowerReplacement,
-       |    $digitReplacement, $defaultMaskedOther));
-       |  $offset += Character.charCount($codePoint);
-       |}
-     """.stripMargin
+  override def build(funcName: String, expressions: Seq[Expression]): Expression = {
+    assert(expressions.size == 5)
+    new Mask(expressions(0), expressions(1), expressions(2), expressions(3), expressions(4))
   }
+}
 
-  def appendUnchangedToStringBuilderCode(
-      ctx: CodegenContext,
-      sb: String,
-      inputString: String,
-      offset: String,
-      numChars: String): String = {
-    val i = ctx.freshName("i")
-    val codePoint = ctx.freshName("codePoint")
-    s"""
-       |for (${CodeGenerator.JAVA_INT} $i = 0; $i < $numChars; $i++) {
-       |  ${CodeGenerator.JAVA_INT} $codePoint = $inputString.codePointAt($offset);
-       |  $sb.appendCodePoint($codePoint);
-       |  $offset += Character.charCount($codePoint);
-       |}
-     """.stripMargin
-  }
+case class Mask(
+    input: Expression,
+    upperChar: Expression,
+    lowerChar: Expression,
+    digitChar: Expression,
+    otherChar: Expression)
+    extends QuinaryExpression
+    with ExpectsInputTypes
+    with QueryErrorsBase {
 
-  def appendMaskedToStringBuilder(
-      sb: java.lang.StringBuilder,
-      inputString: String,
-      startOffset: Int,
-      numChars: Int): Int = {
-    var offset = startOffset
-    (1 to numChars) foreach { _ =>
-      val codePoint = inputString.codePointAt(offset)
-      sb.appendCodePoint(transformChar(
-        codePoint,
-        upperReplacement,
-        lowerReplacement,
-        digitReplacement,
-        defaultMaskedOther))
-      offset += Character.charCount(codePoint)
+  def this(input: Expression) =
+    this(
+      input,
+      Literal.create(Mask.MASKED_UPPERCASE, StringType),
+      Literal.create(Mask.MASKED_LOWERCASE, StringType),
+      Literal.create(Mask.MASKED_DIGIT, StringType),
+      Literal.create(Mask.MASKED_IGNORE, input.dataType))
+
+  def this(input: Expression, upperChar: Expression) =
+    this(
+      input,
+      upperChar,
+      Literal.create(Mask.MASKED_LOWERCASE, StringType),
+      Literal.create(Mask.MASKED_DIGIT, StringType),
+      Literal.create(Mask.MASKED_IGNORE, input.dataType))
+
+  def this(input: Expression, upperChar: Expression, lowerChar: Expression) =
+    this(
+      input,
+      upperChar,
+      lowerChar,
+      Literal.create(Mask.MASKED_DIGIT, StringType),
+      Literal.create(Mask.MASKED_IGNORE, input.dataType))
+
+  def this(
+      input: Expression,
+      upperChar: Expression,
+      lowerChar: Expression,
+      digitChar: Expression) =
+    this(input, upperChar, lowerChar, digitChar,
+      Literal.create(Mask.MASKED_IGNORE, input.dataType))
+
+  override def checkInputDataTypes(): TypeCheckResult = {
+
+    def checkInputDataType(exp: Expression, message: String): Option[TypeCheckResult] = {
+      if (!exp.foldable) {
+        Some(
+          DataTypeMismatch(
+            errorSubClass = "NON_FOLDABLE_INPUT",
+            messageParameters = Map(
+              "inputName" -> toSQLId(message),
+              "inputType" -> toSQLType(exp.dataType),
+              "inputExpr" -> toSQLExpr(exp))))
+      } else {
+        val replaceChar = exp.eval()
+        if (replaceChar != null && replaceChar.asInstanceOf[UTF8String].numChars != 1) {
+          Some(
+            DataTypeMismatch(
+              errorSubClass = "INPUT_SIZE_NOT_ONE",
+              messageParameters = Map("exprName" -> message)))
+        } else {
+          None
+        }
+      }
     }
-    offset
-  }
 
-  def appendUnchangedToStringBuilder(
-      sb: java.lang.StringBuilder,
-      inputString: String,
-      startOffset: Int,
-      numChars: Int): Int = {
-    var offset = startOffset
-    (1 to numChars) foreach { _ =>
-      val codePoint = inputString.codePointAt(offset)
-      sb.appendCodePoint(codePoint)
-      offset += Character.charCount(codePoint)
+    val defaultCheckResult = super.checkInputDataTypes()
+    if (defaultCheckResult.isSuccess) {
+      Seq(
+        (upperChar, "upperChar"),
+        (lowerChar, "lowerChar"),
+        (digitChar, "digitChar"),
+        (otherChar, "otherChar"))
+        .flatMap { case (exp: Expression, message: String) =>
+          checkInputDataType(exp, message)
+        }
+        .headOption
+        .getOrElse(defaultCheckResult)
+    } else {
+      defaultCheckResult
     }
-    offset
   }
+
+  /**
+   * Expected input types from child expressions. The i-th position in the returned seq indicates
+   * the type requirement for the i-th child.
+   *
+   * The possible values at each position are:
+   *   1. a specific data type, e.g. LongType, StringType. 2. a non-leaf abstract data type, e.g.
+   *      NumericType, IntegralType, FractionalType.
+   */
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true),
+      StringTypeWithCollation(supportsTrimCollation = true))
+
+  override def nullable: Boolean = true
+
+  /**
+   * Default behavior of evaluation according to the default nullability of QuinaryExpression. If
+   * subclass of QuinaryExpression override nullable, probably should also override this.
+   */
+  override def eval(input: InternalRow): Any = {
+    Mask.transformInput(
+      children(0).eval(input),
+      children(1).eval(input),
+      children(2).eval(input),
+      children(3).eval(input),
+      children(4).eval(input))
+  }
+
+  /**
+   * Returns Java source code that can be compiled to evaluate this expression. The default
+   * behavior is to call the eval method of the expression. Concrete expression implementations
+   * should override this to do actual code generation.
+   *
+   * @param ctx
+   *   a [[CodegenContext]]
+   * @param ev
+   *   an [[ExprCode]] with unique terms.
+   * @return
+   *   an [[ExprCode]] containing the Java source code to generate the given expression
+   */
+  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode =
+    defineCodeGen(
+      ctx,
+      ev,
+      (input, upperChar, lowerChar, digitChar, otherChar) => {
+        s"org.apache.spark.sql.catalyst.expressions.Mask." +
+          s"transformInput($input, $upperChar, $lowerChar, $digitChar, $otherChar);"
+      })
+
+  /**
+   * Short hand for generating quinary evaluation code. If either of the sub-expressions is null,
+   * the result of this computation is assumed to be null.
+   *
+   * @param f
+   *   function that accepts the 5 non-null evaluation result names of children and returns Java
+   *   code to compute the output.
+   */
+  override protected def nullSafeCodeGen(
+      ctx: CodegenContext,
+      ev: ExprCode,
+      f: (String, String, String, String, String) => String): ExprCode = {
+    val firstGen = children(0).genCode(ctx)
+    val secondGen = children(1).genCode(ctx)
+    val thirdGen = children(2).genCode(ctx)
+    val fourthGen = children(3).genCode(ctx)
+    val fifthGen = children(4).genCode(ctx)
+    val resultCode =
+      f(firstGen.value, secondGen.value, thirdGen.value, fourthGen.value, fifthGen.value)
+    if (nullable) {
+      // this function is somewhat like a `UnaryExpression`, in that only the first child
+      // determines whether the result is null
+      val nullSafeEval = ctx.nullSafeExec(children(0).nullable, firstGen.isNull)(resultCode)
+      ev.copy(code = code"""
+        ${firstGen.code}
+        ${secondGen.code}
+        ${thirdGen.code}
+        ${fourthGen.code}
+        ${fifthGen.code}
+        boolean ${ev.isNull} = ${firstGen.isNull};
+        ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+        $nullSafeEval
+      """)
+    } else {
+      ev.copy(
+        code = code"""
+        ${firstGen.code}
+        ${secondGen.code}
+        ${thirdGen.code}
+        ${fourthGen.code}
+        ${fifthGen.code}
+        ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+        $resultCode""",
+        isNull = FalseLiteral)
+    }
+  }
+
+  /**
+   * Returns the [[DataType]] of the result of evaluating this expression. It is invalid to query
+   * the dataType of an unresolved expression (i.e., when `resolved` == false).
+   */
+  override def dataType: DataType = input.dataType
+
+  /**
+   * Returns a Seq of the children of this node. Children should not change. Immutability required
+   * for containsChild optimization
+   */
+  override def children: Seq[Expression] =
+    Seq(input, upperChar, lowerChar, digitChar, otherChar)
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Mask =
+    copy(
+      input = newChildren(0),
+      upperChar = newChildren(1),
+      lowerChar = newChildren(2),
+      digitChar = newChildren(3),
+      otherChar = newChildren(4))
 }
 
-trait MaskLikeWithN extends MaskLike {
-  def n: Int
-  protected lazy val charCount: Int = if (n < 0) 0 else n
-}
+case class MaskArgument(maskChar: Char, ignore: Boolean)
 
-/**
- * Utils for mask operations.
- */
-object MaskLike {
-  val defaultCharCount = 4
-  val defaultMaskedUppercase: Int = 'X'
-  val defaultMaskedLowercase: Int = 'x'
-  val defaultMaskedDigit: Int = 'n'
-  val defaultMaskedOther: Int = MaskExpressionsUtils.UNMASKED_VAL
+object Mask {
+  // Default character to replace upper-case characters
+  val MASKED_UPPERCASE = 'X'
+  // Default character to replace lower-case characters
+  val MASKED_LOWERCASE = 'x'
+  // Default character to replace digits
+  val MASKED_DIGIT = 'n'
+  // This value helps to retain original value in the input by ignoring the replacement rules
+  val MASKED_IGNORE = null
 
-  def extractCharCount(e: Expression): Int = e match {
-    case Literal(i, IntegerType | NullType) =>
-      if (i == null) defaultCharCount else i.asInstanceOf[Int]
-    case Literal(_, dt) => throw new AnalysisException("Expected literal expression of type " +
-      s"${IntegerType.simpleString}, but got literal of ${dt.simpleString}")
-    case other => throw new AnalysisException(s"Expected literal expression, but got ${other.sql}")
+  def transformInput(
+      input: Any,
+      maskUpper: Any,
+      maskLower: Any,
+      maskDigit: Any,
+      maskOther: Any): UTF8String = {
+
+    val transformedString = if (input == null) {
+      null
+    } else {
+      input.toString.map {
+        transformChar(_, maskUpper, maskLower, maskDigit, maskOther).toChar
+      }
+    }
+    org.apache.spark.unsafe.types.UTF8String.fromString(transformedString)
   }
 
-  def extractReplacement(e: Expression): String = e match {
-    case Literal(s, StringType | NullType) => if (s == null) null else s.toString
-    case Literal(_, dt) => throw new AnalysisException("Expected literal expression of type " +
-      s"${StringType.simpleString}, but got literal of ${dt.simpleString}")
-    case other => throw new AnalysisException(s"Expected literal expression, but got ${other.sql}")
+  private def transformChar(
+      c: Char,
+      maskUpper: Any,
+      maskLower: Any,
+      maskDigit: Any,
+      maskOther: Any): Int = {
+
+    def maskedChar(c: Char, option: Any): Char = {
+      if (option != MASKED_IGNORE) option.asInstanceOf[UTF8String].toString.charAt(0) else c
+    }
+
+    Character.getType(c) match {
+      case Character.UPPERCASE_LETTER => maskedChar(c, maskUpper)
+      case Character.LOWERCASE_LETTER => maskedChar(c, maskLower)
+      case Character.DECIMAL_DIGIT_NUMBER => maskedChar(c, maskDigit)
+      case _ => maskedChar(c, maskOther)
+    }
   }
-}
-
-/**
- * Masks the input string. Additional parameters can be set to change the masking chars for
- * uppercase letters, lowercase letters and digits.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str[, upper[, lower[, digit]]]) - Masks str. By default, upper case letters are converted to \"X\", lower case letters are converted to \"x\" and numbers are converted to \"n\". You can override the characters used in the mask by supplying additional arguments: the second argument controls the mask character for upper case letters, the third argument for lower case letters and the fourth argument for numbers.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("abcd-EFGH-8765-4321", "U", "l", "#");
-       llll-UUUU-####-####
-  """)
-// scalastyle:on line.size.limit
-case class Mask(child: Expression, upper: String, lower: String, digit: String)
-  extends UnaryExpression with ExpectsInputTypes with MaskLike {
-
-  def this(child: Expression) = this(child, null.asInstanceOf[String], null, null)
-
-  def this(child: Expression, upper: Expression) =
-    this(child, extractReplacement(upper), null, null)
-
-  def this(child: Expression, upper: Expression, lower: Expression) =
-    this(child, extractReplacement(upper), extractReplacement(lower), null)
-
-  def this(child: Expression, upper: Expression, lower: Expression, digit: Expression) =
-    this(child, extractReplacement(upper), extractReplacement(lower), extractReplacement(digit))
-
-  override def nullSafeEval(input: Any): Any = {
-    val str = input.asInstanceOf[UTF8String].toString
-    val length = str.codePointCount(0, str.length())
-    val sb = new java.lang.StringBuilder(length)
-    appendMaskedToStringBuilder(sb, str, 0, length)
-    UTF8String.fromString(sb.toString)
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val sb = ctx.freshName("sb")
-      val length = ctx.freshName("length")
-      val offset = ctx.freshName("offset")
-      val inputString = ctx.freshName("inputString")
-      s"""
-         |String $inputString = $input.toString();
-         |${inputStringLengthCode(inputString, length)}
-         |StringBuilder $sb = new StringBuilder($length);
-         |${CodeGenerator.JAVA_INT} $offset = 0;
-         |${appendMaskedToStringBuilderCode(ctx, sb, inputString, offset, length)}
-         |${ev.value} = UTF8String.fromString($sb.toString());
-       """.stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-}
-
-/**
- * Masks the first N chars of the input string. N defaults to 4. Additional parameters can be set
- * to change the masking chars for uppercase letters, lowercase letters and digits.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str[, n[, upper[, lower[, digit]]]]) - Masks the first n values of str. By default, n is 4, upper case letters are converted to \"X\", lower case letters are converted to \"x\" and numbers are converted to \"n\". You can override the characters used in the mask by supplying additional arguments: the second argument controls the mask character for upper case letters, the third argument for lower case letters and the fourth argument for numbers.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("1234-5678-8765-4321", 4);
-       nnnn-5678-8765-4321
-  """)
-// scalastyle:on line.size.limit
-case class MaskFirstN(
-    child: Expression,
-    n: Int,
-    upper: String,
-    lower: String,
-    digit: String)
-  extends UnaryExpression with ExpectsInputTypes with MaskLikeWithN {
-
-  def this(child: Expression) =
-    this(child, defaultCharCount, null, null, null)
-
-  def this(child: Expression, n: Expression) =
-    this(child, extractCharCount(n), null, null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression, lower: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), extractReplacement(lower), null)
-
-  def this(
-      child: Expression,
-      n: Expression,
-      upper: Expression,
-      lower: Expression,
-      digit: Expression) =
-    this(child,
-      extractCharCount(n),
-      extractReplacement(upper),
-      extractReplacement(lower),
-      extractReplacement(digit))
-
-  override def nullSafeEval(input: Any): Any = {
-    val str = input.asInstanceOf[UTF8String].toString
-    val length = str.codePointCount(0, str.length())
-    val endOfMask = if (charCount > length) length else charCount
-    val sb = new java.lang.StringBuilder(length)
-    val offset = appendMaskedToStringBuilder(sb, str, 0, endOfMask)
-    appendUnchangedToStringBuilder(sb, str, offset, length - endOfMask)
-    UTF8String.fromString(sb.toString)
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val sb = ctx.freshName("sb")
-      val length = ctx.freshName("length")
-      val offset = ctx.freshName("offset")
-      val inputString = ctx.freshName("inputString")
-      val endOfMask = ctx.freshName("endOfMask")
-      s"""
-         |String $inputString = $input.toString();
-         |${inputStringLengthCode(inputString, length)}
-         |${CodeGenerator.JAVA_INT} $endOfMask = $charCount > $length ? $length : $charCount;
-         |${CodeGenerator.JAVA_INT} $offset = 0;
-         |StringBuilder $sb = new StringBuilder($length);
-         |${appendMaskedToStringBuilderCode(ctx, sb, inputString, offset, endOfMask)}
-         |${appendUnchangedToStringBuilderCode(
-              ctx, sb, inputString, offset, s"$length - $endOfMask")}
-         |${ev.value} = UTF8String.fromString($sb.toString());
-         |""".stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-
-  override def prettyName: String = "mask_first_n"
-}
-
-/**
- * Masks the last N chars of the input string. N defaults to 4. Additional parameters can be set
- * to change the masking chars for uppercase letters, lowercase letters and digits.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str[, n[, upper[, lower[, digit]]]]) - Masks the last n values of str. By default, n is 4, upper case letters are converted to \"X\", lower case letters are converted to \"x\" and numbers are converted to \"n\". You can override the characters used in the mask by supplying additional arguments: the second argument controls the mask character for upper case letters, the third argument for lower case letters and the fourth argument for numbers.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("1234-5678-8765-4321", 4);
-       1234-5678-8765-nnnn
-  """, since = "2.4.0")
-// scalastyle:on line.size.limit
-case class MaskLastN(
-    child: Expression,
-    n: Int,
-    upper: String,
-    lower: String,
-    digit: String)
-  extends UnaryExpression with ExpectsInputTypes with MaskLikeWithN {
-
-  def this(child: Expression) =
-    this(child, defaultCharCount, null, null, null)
-
-  def this(child: Expression, n: Expression) =
-    this(child, extractCharCount(n), null, null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression, lower: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), extractReplacement(lower), null)
-
-  def this(
-      child: Expression,
-      n: Expression,
-      upper: Expression,
-      lower: Expression,
-      digit: Expression) =
-    this(child,
-      extractCharCount(n),
-      extractReplacement(upper),
-      extractReplacement(lower),
-      extractReplacement(digit))
-
-  override def nullSafeEval(input: Any): Any = {
-    val str = input.asInstanceOf[UTF8String].toString
-    val length = str.codePointCount(0, str.length())
-    val startOfMask = if (charCount >= length) 0 else length - charCount
-    val sb = new java.lang.StringBuilder(length)
-    val offset = appendUnchangedToStringBuilder(sb, str, 0, startOfMask)
-    appendMaskedToStringBuilder(sb, str, offset, length - startOfMask)
-    UTF8String.fromString(sb.toString)
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val sb = ctx.freshName("sb")
-      val length = ctx.freshName("length")
-      val offset = ctx.freshName("offset")
-      val inputString = ctx.freshName("inputString")
-      val startOfMask = ctx.freshName("startOfMask")
-      s"""
-         |String $inputString = $input.toString();
-         |${inputStringLengthCode(inputString, length)}
-         |${CodeGenerator.JAVA_INT} $startOfMask = $charCount >= $length ?
-         |  0 : $length - $charCount;
-         |${CodeGenerator.JAVA_INT} $offset = 0;
-         |StringBuilder $sb = new StringBuilder($length);
-         |${appendUnchangedToStringBuilderCode(ctx, sb, inputString, offset, startOfMask)}
-         |${appendMaskedToStringBuilderCode(
-              ctx, sb, inputString, offset, s"$length - $startOfMask")}
-         |${ev.value} = UTF8String.fromString($sb.toString());
-         |""".stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-
-  override def prettyName: String = "mask_last_n"
-}
-
-/**
- * Masks all but the first N chars of the input string. N defaults to 4. Additional parameters can
- * be set to change the masking chars for uppercase letters, lowercase letters and digits.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str[, n[, upper[, lower[, digit]]]]) - Masks all but the first n values of str. By default, n is 4, upper case letters are converted to \"X\", lower case letters are converted to \"x\" and numbers are converted to \"n\". You can override the characters used in the mask by supplying additional arguments: the second argument controls the mask character for upper case letters, the third argument for lower case letters and the fourth argument for numbers.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("1234-5678-8765-4321", 4);
-       1234-nnnn-nnnn-nnnn
-  """, since = "2.4.0")
-// scalastyle:on line.size.limit
-case class MaskShowFirstN(
-    child: Expression,
-    n: Int,
-    upper: String,
-    lower: String,
-    digit: String)
-  extends UnaryExpression with ExpectsInputTypes with MaskLikeWithN {
-
-  def this(child: Expression) =
-    this(child, defaultCharCount, null, null, null)
-
-  def this(child: Expression, n: Expression) =
-    this(child, extractCharCount(n), null, null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression, lower: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), extractReplacement(lower), null)
-
-  def this(
-      child: Expression,
-      n: Expression,
-      upper: Expression,
-      lower: Expression,
-      digit: Expression) =
-    this(child,
-      extractCharCount(n),
-      extractReplacement(upper),
-      extractReplacement(lower),
-      extractReplacement(digit))
-
-  override def nullSafeEval(input: Any): Any = {
-    val str = input.asInstanceOf[UTF8String].toString
-    val length = str.codePointCount(0, str.length())
-    val startOfMask = if (charCount > length) length else charCount
-    val sb = new java.lang.StringBuilder(length)
-    val offset = appendUnchangedToStringBuilder(sb, str, 0, startOfMask)
-    appendMaskedToStringBuilder(sb, str, offset, length - startOfMask)
-    UTF8String.fromString(sb.toString)
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val sb = ctx.freshName("sb")
-      val length = ctx.freshName("length")
-      val offset = ctx.freshName("offset")
-      val inputString = ctx.freshName("inputString")
-      val startOfMask = ctx.freshName("startOfMask")
-      s"""
-         |String $inputString = $input.toString();
-         |${inputStringLengthCode(inputString, length)}
-         |${CodeGenerator.JAVA_INT} $startOfMask = $charCount > $length ? $length : $charCount;
-         |${CodeGenerator.JAVA_INT} $offset = 0;
-         |StringBuilder $sb = new StringBuilder($length);
-         |${appendUnchangedToStringBuilderCode(ctx, sb, inputString, offset, startOfMask)}
-         |${appendMaskedToStringBuilderCode(
-              ctx, sb, inputString, offset, s"$length - $startOfMask")}
-         |${ev.value} = UTF8String.fromString($sb.toString());
-         |""".stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-
-  override def prettyName: String = "mask_show_first_n"
-}
-
-/**
- * Masks all but the last N chars of the input string. N defaults to 4. Additional parameters can
- * be set to change the masking chars for uppercase letters, lowercase letters and digits.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str[, n[, upper[, lower[, digit]]]]) - Masks all but the last n values of str. By default, n is 4, upper case letters are converted to \"X\", lower case letters are converted to \"x\" and numbers are converted to \"n\". You can override the characters used in the mask by supplying additional arguments: the second argument controls the mask character for upper case letters, the third argument for lower case letters and the fourth argument for numbers.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("1234-5678-8765-4321", 4);
-       nnnn-nnnn-nnnn-4321
-  """, since = "2.4.0")
-// scalastyle:on line.size.limit
-case class MaskShowLastN(
-    child: Expression,
-    n: Int,
-    upper: String,
-    lower: String,
-    digit: String)
-  extends UnaryExpression with ExpectsInputTypes with MaskLikeWithN {
-
-  def this(child: Expression) =
-    this(child, defaultCharCount, null, null, null)
-
-  def this(child: Expression, n: Expression) =
-    this(child, extractCharCount(n), null, null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), null, null)
-
-  def this(child: Expression, n: Expression, upper: Expression, lower: Expression) =
-    this(child, extractCharCount(n), extractReplacement(upper), extractReplacement(lower), null)
-
-  def this(
-      child: Expression,
-      n: Expression,
-      upper: Expression,
-      lower: Expression,
-      digit: Expression) =
-    this(child,
-      extractCharCount(n),
-      extractReplacement(upper),
-      extractReplacement(lower),
-      extractReplacement(digit))
-
-  override def nullSafeEval(input: Any): Any = {
-    val str = input.asInstanceOf[UTF8String].toString
-    val length = str.codePointCount(0, str.length())
-    val endOfMask = if (charCount >= length) 0 else length - charCount
-    val sb = new java.lang.StringBuilder(length)
-    val offset = appendMaskedToStringBuilder(sb, str, 0, endOfMask)
-    appendUnchangedToStringBuilder(sb, str, offset, length - endOfMask)
-    UTF8String.fromString(sb.toString)
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val sb = ctx.freshName("sb")
-      val length = ctx.freshName("length")
-      val offset = ctx.freshName("offset")
-      val inputString = ctx.freshName("inputString")
-      val endOfMask = ctx.freshName("endOfMask")
-      s"""
-         |String $inputString = $input.toString();
-         |${inputStringLengthCode(inputString, length)}
-         |${CodeGenerator.JAVA_INT} $endOfMask = $charCount >= $length ? 0 : $length - $charCount;
-         |${CodeGenerator.JAVA_INT} $offset = 0;
-         |StringBuilder $sb = new StringBuilder($length);
-         |${appendMaskedToStringBuilderCode(ctx, sb, inputString, offset, endOfMask)}
-         |${appendUnchangedToStringBuilderCode(
-              ctx, sb, inputString, offset, s"$length - $endOfMask")}
-         |${ev.value} = UTF8String.fromString($sb.toString());
-         |""".stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-
-  override def prettyName: String = "mask_show_last_n"
-}
-
-/**
- * Returns a hashed value based on str.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = "_FUNC_(str) - Returns a hashed value based on str. The hash is consistent and can be used to join masked values together across tables.",
-  examples = """
-    Examples:
-      > SELECT _FUNC_("abcd-EFGH-8765-4321");
-       60c713f5ec6912229d2060df1c322776
-  """)
-// scalastyle:on line.size.limit
-case class MaskHash(child: Expression)
-  extends UnaryExpression with ExpectsInputTypes {
-
-  override def nullSafeEval(input: Any): Any = {
-    UTF8String.fromString(DigestUtils.md5Hex(input.asInstanceOf[UTF8String].toString))
-  }
-
-  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    nullSafeCodeGen(ctx, ev, (input: String) => {
-      val digestUtilsClass = classOf[DigestUtils].getName.stripSuffix("$")
-      s"""
-         |${ev.value} = UTF8String.fromString($digestUtilsClass.md5Hex($input.toString()));
-         |""".stripMargin
-    })
-  }
-
-  override def dataType: DataType = StringType
-
-  override def inputTypes: Seq[AbstractDataType] = Seq(StringType)
-
-  override def prettyName: String = "mask_hash"
 }

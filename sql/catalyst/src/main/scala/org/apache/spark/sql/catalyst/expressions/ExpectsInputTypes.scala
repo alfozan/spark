@@ -18,6 +18,8 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
+import org.apache.spark.sql.errors.QueryErrorsBase
 import org.apache.spark.sql.types.AbstractDataType
 
 /**
@@ -26,7 +28,7 @@ import org.apache.spark.sql.types.AbstractDataType
  * This trait is typically used by operator expressions (e.g. [[Add]], [[Subtract]]) to define
  * expected input types without any implicit casting.
  *
- * Most function expressions (e.g. [[Substring]] should extends [[ImplicitCastInputTypes]]) instead.
+ * Most function expressions (e.g. [[Substring]] should extend [[ImplicitCastInputTypes]]) instead.
  */
 trait ExpectsInputTypes extends Expression {
 
@@ -41,20 +43,29 @@ trait ExpectsInputTypes extends Expression {
   def inputTypes: Seq[AbstractDataType]
 
   override def checkInputDataTypes(): TypeCheckResult = {
-    val mismatches = children.zip(inputTypes).zipWithIndex.collect {
-      case ((child, expected), idx) if !expected.acceptsType(child.dataType) =>
-        s"argument ${idx + 1} requires ${expected.simpleString} type, " +
-          s"however, '${child.sql}' is of ${child.dataType.simpleString} type."
-    }
-
-    if (mismatches.isEmpty) {
-      TypeCheckResult.TypeCheckSuccess
-    } else {
-      TypeCheckResult.TypeCheckFailure(mismatches.mkString(" "))
-    }
+    ExpectsInputTypes.checkInputDataTypes(children, inputTypes)
   }
 }
 
+object ExpectsInputTypes extends QueryErrorsBase {
+
+  def checkInputDataTypes(
+      inputs: Seq[Expression],
+      inputTypes: Seq[AbstractDataType]): TypeCheckResult = {
+    val mismatch = inputs.zip(inputTypes).zipWithIndex.collectFirst {
+      case ((input, expected), idx) if !expected.acceptsType(input.dataType) =>
+        DataTypeMismatch(
+          errorSubClass = "UNEXPECTED_INPUT_TYPE",
+          messageParameters = Map(
+            "paramIndex" -> ordinalNumber(idx),
+            "requiredType" -> toSQLType(expected),
+            "inputSql" -> toSQLExpr(input),
+            "inputType" -> toSQLType(input.dataType)))
+    }
+
+    mismatch.getOrElse(TypeCheckResult.TypeCheckSuccess)
+  }
+}
 
 /**
  * A mixin for the analyzer to perform implicit type casting using

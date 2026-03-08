@@ -23,10 +23,11 @@ import java.nio.file.Files
 
 import org.apache.hadoop.conf.Configuration
 
+import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
-class HadoopFileLinesReaderSuite extends SharedSQLContext {
+class HadoopFileLinesReaderSuite extends SharedSparkSession {
   def getLines(
       path: File,
       text: String,
@@ -36,13 +37,17 @@ class HadoopFileLinesReaderSuite extends SharedSQLContext {
     val delimOpt = delimiter.map(_.getBytes(StandardCharsets.UTF_8))
     Files.write(path.toPath, text.getBytes(StandardCharsets.UTF_8))
 
-    val lines = ranges.map { case (start, length) =>
-      val file = PartitionedFile(InternalRow.empty, path.getCanonicalPath, start, length)
-      val hadoopConf = conf.getOrElse(spark.sparkContext.hadoopConfiguration)
+    val lines = ranges.flatMap { case (start, length) =>
+      val file = PartitionedFile(
+        InternalRow.empty,
+        SparkPath.fromPathString(path.getCanonicalPath),
+        start,
+        length)
+      val hadoopConf = conf.getOrElse(spark.sessionState.newHadoopConf())
       val reader = new HadoopFileLinesReader(file, delimOpt, hadoopConf)
 
       reader.map(_.toString)
-    }.flatten
+    }
 
     lines
   }
@@ -111,20 +116,20 @@ class HadoopFileLinesReaderSuite extends SharedSQLContext {
   }
 
   test("io.file.buffer.size is less than line length") {
-    val conf = spark.sparkContext.hadoopConfiguration
-    conf.set("io.file.buffer.size", "2")
-    withTempPath { path =>
-      val lines = getLines(path, text = "abcdef\n123456", ranges = Seq((4, 4), (8, 5)))
-      assert(lines == Seq("123456"))
+    withSQLConf("io.file.buffer.size" -> "2") {
+      withTempPath { path =>
+        val lines = getLines(path, text = "abcdef\n123456", ranges = Seq((4, 4), (8, 5)))
+        assert(lines == Seq("123456"))
+      }
     }
   }
 
   test("line cannot be longer than line.maxlength") {
-    val conf = spark.sparkContext.hadoopConfiguration
-    conf.set("mapreduce.input.linerecordreader.line.maxlength", "5")
-    withTempPath { path =>
-      val lines = getLines(path, text = "abcdef\n1234", ranges = Seq((0, 15)))
-      assert(lines == Seq("1234"))
+    withSQLConf("mapreduce.input.linerecordreader.line.maxlength" -> "5") {
+      withTempPath { path =>
+        val lines = getLines(path, text = "abcdef\n1234", ranges = Seq((0, 15)))
+        assert(lines == Seq("1234"))
+      }
     }
   }
 

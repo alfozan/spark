@@ -36,10 +36,14 @@ class SortBasedAggregationStoreSuite  extends SparkFunSuite with LocalSparkConte
     sc = new SparkContext("local[2, 4]", "test", conf)
     val taskManager = new TaskMemoryManager(new TestMemoryManager(conf), 0)
     TaskContext.setTaskContext(
-      new TaskContextImpl(0, 0, 0, 0, 0, taskManager, new Properties, null))
+      new TaskContextImpl(0, 0, 0, 0, 0, 1, taskManager, new Properties, null))
   }
 
-  override def afterAll(): Unit = TaskContext.unset()
+  override def afterAll(): Unit = try {
+    TaskContext.unset()
+  } finally {
+    super.afterAll()
+  }
 
   private val rand = new java.util.Random()
 
@@ -74,7 +78,7 @@ class SortBasedAggregationStoreSuite  extends SparkFunSuite with LocalSparkConte
       groupingSchema,
       updateInputRow,
       mergeAggBuffer,
-      createNewAggregationBuffer)
+      createNewAggregationBuffer())
 
     (5000 to 100000).foreach { _ =>
       randomKV(inputRow, group)
@@ -84,7 +88,7 @@ class SortBasedAggregationStoreSuite  extends SparkFunSuite with LocalSparkConte
     }
 
     val iter = store.destructiveIterator()
-    while(iter.hasNext) {
+    while (iter.hasNext) {
       val agg = iter.next()
       assert(agg.aggregationBuffer.getInt(0) == expected(agg.groupingKey.getInt(0)))
     }
@@ -120,7 +124,8 @@ class SortBasedAggregationStoreSuite  extends SparkFunSuite with LocalSparkConte
   def createSortedAggBufferIterator(
       hashMap: ObjectAggregationMap): KVIterator[UnsafeRow, UnsafeRow] = {
 
-    val sortedIterator = hashMap.iterator.toList.sortBy(_.groupingKey.getInt(0)).iterator
+    val sortedIterator = hashMap.destructiveIterator().toList.sortBy(_.groupingKey.getInt(0))
+      .iterator
     new KVIterator[UnsafeRow, UnsafeRow] {
       var key: UnsafeRow = null
       var value: UnsafeRow = null
@@ -136,7 +141,7 @@ class SortBasedAggregationStoreSuite  extends SparkFunSuite with LocalSparkConte
       }
       override def getKey(): UnsafeRow = key
       override def getValue(): UnsafeRow = value
-      override def close(): Unit = Unit
+      override def close(): Unit = ()
     }
   }
 }

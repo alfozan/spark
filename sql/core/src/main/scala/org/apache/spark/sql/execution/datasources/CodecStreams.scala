@@ -28,20 +28,11 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat
 import org.apache.hadoop.util.ReflectionUtils
 
 import org.apache.spark.TaskContext
+import org.apache.spark.io.HadoopCodecStreams
 
 object CodecStreams {
-  private def getDecompressionCodec(config: Configuration, file: Path): Option[CompressionCodec] = {
-    val compressionCodecs = new CompressionCodecFactory(config)
-    Option(compressionCodecs.getCodec(file))
-  }
-
   def createInputStream(config: Configuration, file: Path): InputStream = {
-    val fs = file.getFileSystem(config)
-    val inputStream: InputStream = fs.open(file)
-
-    getDecompressionCodec(config, file)
-      .map(codec => codec.createInputStream(inputStream))
-      .getOrElse(inputStream)
+    HadoopCodecStreams.createInputStream(config, file)
   }
 
   /**
@@ -50,7 +41,7 @@ object CodecStreams {
    */
   def createInputStreamWithCloseResource(config: Configuration, path: Path): InputStream = {
     val inputStream = createInputStream(config, path)
-    Option(TaskContext.get()).foreach(_.addTaskCompletionListener(_ => inputStream.close()))
+    Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => inputStream.close()))
     inputStream
   }
 

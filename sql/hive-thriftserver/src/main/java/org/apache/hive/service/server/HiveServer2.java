@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,18 +19,17 @@ package org.apache.hive.service.server;
 
 import java.util.Properties;
 
+import scala.runtime.AbstractFunction0;
+import scala.runtime.BoxedUnit;
+
 import org.apache.commons.cli.GnuParser;
 import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hive.common.LogUtils;
-import org.apache.hadoop.hive.common.LogUtils.LogInitializationException;
+import org.apache.hadoop.hive.common.JvmPauseMonitor;
 import org.apache.hadoop.hive.conf.HiveConf;
-import org.apache.hadoop.hive.shims.ShimLoader;
 import org.apache.hive.common.util.HiveStringUtils;
 import org.apache.hive.service.CompositeService;
 import org.apache.hive.service.cli.CLIService;
@@ -39,12 +37,19 @@ import org.apache.hive.service.cli.thrift.ThriftBinaryCLIService;
 import org.apache.hive.service.cli.thrift.ThriftCLIService;
 import org.apache.hive.service.cli.thrift.ThriftHttpCLIService;
 
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
+import org.apache.spark.util.ShutdownHookManager;
+import org.apache.spark.util.SparkExitCode;
+
 /**
  * HiveServer2.
  *
  */
 public class HiveServer2 extends CompositeService {
-  private static final Log LOG = LogFactory.getLog(HiveServer2.class);
+  private static final SparkLogger LOG = SparkLoggerFactory.getLogger(HiveServer2.class);
 
   private CLIService cliService;
   private ThriftCLIService thriftCLIService;
@@ -67,13 +72,23 @@ public class HiveServer2 extends CompositeService {
     super.init(hiveConf);
 
     // Add a shutdown hook for catching SIGTERM & SIGINT
-    final HiveServer2 hiveServer2 = this;
-    Runtime.getRuntime().addShutdownHook(new Thread() {
-      @Override
-      public void run() {
-        hiveServer2.stop();
-      }
-    });
+    // this must be higher than the Hadoop Filesystem priority of 10,
+    // which the default priority is.
+    // The signature of the callback must match that of a scala () -> Unit
+    // function
+    ShutdownHookManager.addShutdownHook(
+        new AbstractFunction0<BoxedUnit>() {
+          public BoxedUnit apply() {
+            try {
+              LOG.info("Hive Server Shutdown hook invoked");
+              stop();
+            } catch (Throwable e) {
+              LOG.warn("Ignoring Exception while stopping Hive Server from shutdown hook",
+                  e);
+            }
+            return BoxedUnit.UNIT;
+          }
+        });
   }
 
   public static boolean isHTTPTransportMode(HiveConf hiveConf) {
@@ -95,7 +110,6 @@ public class HiveServer2 extends CompositeService {
   @Override
   public synchronized void stop() {
     LOG.info("Shutting down HiveServer2");
-    HiveConf hiveConf = this.getHiveConf();
     super.stop();
   }
 
@@ -110,7 +124,12 @@ public class HiveServer2 extends CompositeService {
         server = new HiveServer2();
         server.init(hiveConf);
         server.start();
-        ShimLoader.getHadoopShims().startPauseMonitor(hiveConf);
+        try {
+          JvmPauseMonitor pauseMonitor = new JvmPauseMonitor(hiveConf);
+          pauseMonitor.start();
+        } catch (Throwable t) {
+          LOG.warn("Could not initiate the JvmPauseMonitor thread.", t);
+        }
         break;
       } catch (Throwable throwable) {
         if (server != null) {
@@ -125,8 +144,8 @@ public class HiveServer2 extends CompositeService {
         if (++attempts >= maxAttempts) {
           throw new Error("Max start attempts " + maxAttempts + " exhausted", throwable);
         } else {
-          LOG.warn("Error starting HiveServer2 on attempt " + attempts
-              + ", will retry in 60 seconds", throwable);
+          LOG.warn("Error starting HiveServer2 on attempt {}, will retry in 60 seconds",
+            throwable, MDC.of(LogKeys.NUM_RETRY, attempts));
           try {
             Thread.sleep(60L * 1000L);
           } catch (InterruptedException e) {
@@ -139,25 +158,13 @@ public class HiveServer2 extends CompositeService {
 
   public static void main(String[] args) {
     HiveConf.setLoadHiveServer2Config(true);
-    try {
-      ServerOptionsProcessor oproc = new ServerOptionsProcessor("hiveserver2");
-      ServerOptionsProcessorResponse oprocResponse = oproc.parse(args);
+    ServerOptionsProcessor oproc = new ServerOptionsProcessor("hiveserver2");
+    ServerOptionsProcessorResponse oprocResponse = oproc.parse(args);
 
-      // NOTE: It is critical to do this here so that log4j is reinitialized
-      // before any of the other core hive classes are loaded
-      String initLog4jMessage = LogUtils.initHiveLog4j();
-      LOG.debug(initLog4jMessage);
-      HiveStringUtils.startupShutdownMessage(HiveServer2.class, args, LOG);
+    HiveStringUtils.startupShutdownMessage(HiveServer2.class, args, LOG.getSlf4jLogger());
 
-      // Log debug message from "oproc" after log4j initialize properly
-      LOG.debug(oproc.getDebugMessage().toString());
-
-      // Call the executor which will execute the appropriate command based on the parsed options
-      oprocResponse.getServerOptionsExecutor().execute();
-    } catch (LogInitializationException e) {
-      LOG.error("Error initializing log: " + e.getMessage(), e);
-      System.exit(-1);
-    }
+    // Call the executor which will execute the appropriate command based on the parsed options
+    oprocResponse.getServerOptionsExecutor().execute();
   }
 
   /**
@@ -255,7 +262,7 @@ public class HiveServer2 extends CompositeService {
     @Override
     public void execute() {
       new HelpFormatter().printHelp(serverName, options);
-      System.exit(0);
+      System.exit(SparkExitCode.EXIT_SUCCESS());
     }
   }
 
@@ -269,7 +276,7 @@ public class HiveServer2 extends CompositeService {
       try {
         startHiveServer2();
       } catch (Throwable t) {
-        LOG.fatal("Error starting HiveServer2", t);
+        LOG.error("Error starting HiveServer2", t);
         System.exit(-1);
       }
     }

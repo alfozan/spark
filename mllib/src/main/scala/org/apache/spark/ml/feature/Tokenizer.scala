@@ -22,6 +22,7 @@ import org.apache.spark.ml.UnaryTransformer
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.types.{ArrayType, DataType, StringType}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A tokenizer that converts the input string to lowercase and then splits it by white spaces.
@@ -36,11 +37,14 @@ class Tokenizer @Since("1.4.0") (@Since("1.4.0") override val uid: String)
   def this() = this(Identifiable.randomUID("tok"))
 
   override protected def createTransformFunc: String => Seq[String] = {
-    _.toLowerCase.split("\\s")
+    // scalastyle:off caselocale
+    _.toLowerCase.split("\\s").toImmutableArraySeq
+    // scalastyle:on caselocale
   }
 
   override protected def validateInputType(inputType: DataType): Unit = {
-    require(inputType == StringType, s"Input type must be string type but got $inputType.")
+    require(inputType == StringType,
+      s"Input type must be ${StringType.catalogString} type but got ${inputType.catalogString}.")
   }
 
   override protected def outputDataType: DataType = new ArrayType(StringType, true)
@@ -137,12 +141,19 @@ class RegexTokenizer @Since("1.4.0") (@Since("1.4.0") override val uid: String)
 
   setDefault(minTokenLength -> 1, gaps -> true, pattern -> "\\s+", toLowercase -> true)
 
-  override protected def createTransformFunc: String => Seq[String] = { originStr =>
+  override protected def createTransformFunc: String => Seq[String] = {
     val re = $(pattern).r
-    val str = if ($(toLowercase)) originStr.toLowerCase() else originStr
-    val tokens = if ($(gaps)) re.split(str).toSeq else re.findAllIn(str).toSeq
-    val minLength = $(minTokenLength)
-    tokens.filter(_.length >= minLength)
+    val localToLowercase = $(toLowercase)
+    val localGaps = $(gaps)
+    val localMinTokenLength = $(minTokenLength)
+
+    (originStr: String) => {
+      // scalastyle:off caselocale
+      val str = if (localToLowercase) originStr.toLowerCase() else originStr
+      // scalastyle:on caselocale
+      val tokens = if (localGaps) re.split(str).toImmutableArraySeq else re.findAllIn(str).toSeq
+      tokens.filter(_.length >= localMinTokenLength)
+    }
   }
 
   override protected def validateInputType(inputType: DataType): Unit = {
@@ -153,6 +164,12 @@ class RegexTokenizer @Since("1.4.0") (@Since("1.4.0") override val uid: String)
 
   @Since("1.4.1")
   override def copy(extra: ParamMap): RegexTokenizer = defaultCopy(extra)
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"RegexTokenizer: uid=$uid, minTokenLength=${$(minTokenLength)}, gaps=${$(gaps)}, " +
+      s"pattern=${$(pattern)}, toLowercase=${$(toLowercase)}"
+  }
 }
 
 @Since("1.6.0")

@@ -19,12 +19,14 @@ package org.apache.spark.sql.execution.datasources.text
 
 import java.io.File
 
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.{QueryTest, Row}
+import org.apache.spark.sql.catalyst.util.HadoopCompressionCodec.GZIP
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{StringType, StructType}
 
-class WholeTextFileSuite extends QueryTest with SharedSQLContext {
+abstract class WholeTextFileSuite extends QueryTest with SharedSparkSession {
 
   // Hadoop's FileSystem caching does not use the Configuration as part of its cache key, which
   // can cause Filesystem.get(Configuration) to return a cached instance created with a different
@@ -35,13 +37,10 @@ class WholeTextFileSuite extends QueryTest with SharedSQLContext {
   protected override def sparkConf =
     super.sparkConf.set("spark.hadoop.fs.file.impl.disable.cache", "true")
 
-  private def testFile: String = {
-    Thread.currentThread().getContextClassLoader.getResource("test-data/text-suite.txt").toString
-  }
-
   test("reading text file with option wholetext=true") {
     val df = spark.read.option("wholetext", "true")
-      .format("text").load(testFile)
+      .format("text")
+      .load(testFile("test-data/text-suite.txt"))
     // schema
     assert(df.schema == new StructType().add("value", StringType))
 
@@ -92,7 +91,7 @@ class WholeTextFileSuite extends QueryTest with SharedSQLContext {
     withTempDir { dir =>
       val path = dir.getCanonicalPath
       val df1 = spark.range(0, 1000).selectExpr("CAST(id AS STRING) AS s").repartition(1)
-      df1.write.option("compression", "gzip").mode("overwrite").text(path)
+      df1.write.option("compression", GZIP.lowerCaseName()).mode("overwrite").text(path)
       // On reading through wholetext mode, one file will be read as a single row, i.e. not
       // delimited by "next line" character.
       val expected = Row(df1.collect().map(_.getString(0)).mkString("", "\n", "\n"))
@@ -105,4 +104,18 @@ class WholeTextFileSuite extends QueryTest with SharedSQLContext {
       }
     }
   }
+}
+
+class WholeTextFileV1Suite extends WholeTextFileSuite {
+  override protected def sparkConf: SparkConf =
+    super
+      .sparkConf
+      .set(SQLConf.USE_V1_SOURCE_LIST, "text")
+}
+
+class WholeTextFileV2Suite extends WholeTextFileSuite {
+  override protected def sparkConf: SparkConf =
+    super
+      .sparkConf
+      .set(SQLConf.USE_V1_SOURCE_LIST, "")
 }

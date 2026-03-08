@@ -29,6 +29,7 @@ import org.apache.spark.ml.feature.RFormula
 import org.apache.spark.ml.regression.{AFTSurvivalRegression, AFTSurvivalRegressionModel}
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.util.ArrayImplicits._
 
 private[r] class AFTSurvivalRegressionWrapper private (
     val pipeline: PipelineModel,
@@ -59,26 +60,26 @@ private[r] class AFTSurvivalRegressionWrapper private (
 
 private[r] object AFTSurvivalRegressionWrapper extends MLReadable[AFTSurvivalRegressionWrapper] {
 
-  private def formulaRewrite(formula: String): (String, String) = {
-    var rewritedFormula: String = null
-    var censorCol: String = null
+  private val FORMULA_REGEXP = """Surv\(([^,]+), ([^,]+)\) ~ (.+)""".r
 
-    val regex = """Surv\(([^,]+), ([^,]+)\) ~ (.+)""".r
+  private def formulaRewrite(formula: String): (String, String) = {
+    var rewrittenFormula: String = null
+    var censorCol: String = null
     try {
-      val regex(label, censor, features) = formula
+      val FORMULA_REGEXP(label, censor, features) = formula
       // TODO: Support dot operator.
       if (features.contains(".")) {
         throw new UnsupportedOperationException(
           "Terms of survreg formula can not support dot operator.")
       }
-      rewritedFormula = label.trim + "~" + features.trim
+      rewrittenFormula = label.trim + "~" + features.trim
       censorCol = censor.trim
     } catch {
       case e: MatchError =>
         throw new SparkException(s"Could not parse formula: $formula")
     }
 
-    (rewritedFormula, censorCol)
+    (rewrittenFormula, censorCol)
   }
 
 
@@ -88,9 +89,9 @@ private[r] object AFTSurvivalRegressionWrapper extends MLReadable[AFTSurvivalReg
       aggregationDepth: Int,
       stringIndexerOrderType: String): AFTSurvivalRegressionWrapper = {
 
-    val (rewritedFormula, censorCol) = formulaRewrite(formula)
+    val (rewrittenFormula, censorCol) = formulaRewrite(formula)
 
-    val rFormula = new RFormula().setFormula(rewritedFormula)
+    val rFormula = new RFormula().setFormula(rewrittenFormula)
       .setStringIndexerOrderType(stringIndexerOrderType)
     RWrapperUtils.checkDataColumns(rFormula, data)
     val rFormulaModel = rFormula.fit(data)
@@ -126,9 +127,11 @@ private[r] object AFTSurvivalRegressionWrapper extends MLReadable[AFTSurvivalReg
       val pipelinePath = new Path(path, "pipeline").toString
 
       val rMetadata = ("class" -> instance.getClass.getName) ~
-        ("features" -> instance.features.toSeq)
+        ("features" -> instance.features.toImmutableArraySeq)
       val rMetadataJson: String = compact(render(rMetadata))
-      sc.parallelize(Seq(rMetadataJson), 1).saveAsTextFile(rMetadataPath)
+      // Note that we should write single file. If there are more than one row
+      // it produces more partitions.
+      sparkSession.createDataFrame(Seq(Tuple1(rMetadataJson))).write.text(rMetadataPath)
 
       instance.pipeline.save(pipelinePath)
     }
@@ -137,11 +140,12 @@ private[r] object AFTSurvivalRegressionWrapper extends MLReadable[AFTSurvivalReg
   class AFTSurvivalRegressionWrapperReader extends MLReader[AFTSurvivalRegressionWrapper] {
 
     override def load(path: String): AFTSurvivalRegressionWrapper = {
-      implicit val format = DefaultFormats
+      implicit val format: Formats = DefaultFormats
       val rMetadataPath = new Path(path, "rMetadata").toString
       val pipelinePath = new Path(path, "pipeline").toString
 
-      val rMetadataStr = sc.textFile(rMetadataPath, 1).first()
+      val rMetadataStr = sparkSession.read.text(rMetadataPath)
+        .first().getString(0)
       val rMetadata = parse(rMetadataStr)
       val features = (rMetadata \ "features").extract[Array[String]]
 

@@ -18,10 +18,12 @@
 package org.apache.spark.mllib.feature
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
+import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
 import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
+import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.collection.Utils.createArray
 
 class PCASuite extends SparkFunSuite with MLlibTestSparkContext {
 
@@ -31,7 +33,7 @@ class PCASuite extends SparkFunSuite with MLlibTestSparkContext {
     Vectors.dense(4.0, 0.0, 0.0, 6.0, 7.0)
   )
 
-  private lazy val dataRDD = sc.parallelize(data, 2)
+  private lazy val dataRDD = sc.parallelize(data.toImmutableArraySeq, 2)
 
   test("Correct computing use a PCA wrapper") {
     val k = dataRDD.count().toInt
@@ -53,5 +55,26 @@ class PCASuite extends SparkFunSuite with MLlibTestSparkContext {
     assert(PCAUtil.memoryCost(10, 100) < Int.MaxValue)
     // check overflowing
     assert(PCAUtil.memoryCost(40000, 60000) > Int.MaxValue)
+  }
+
+  test("number of features more than 65535") {
+    val data1 = sc.parallelize(Seq(
+      Vectors.dense(createArray(100000, 2.0)),
+      Vectors.dense(createArray(100000, 0.0))
+    ), 2)
+
+    val pca = new PCA(2).fit(data1)
+    // Eigen values should not be negative
+    assert(pca.explainedVariance.values.forall(_ >= 0))
+    // Norm of the principal component should be 1.0
+    assert(Math.sqrt(pca.pc.values.slice(0, 100000)
+      .map(Math.pow(_, 2)).sum) ~== 1.0 relTol 1e-8)
+    // Leading explainedVariance is 1.0
+    assert(pca.explainedVariance(0) ~== 1.0 relTol 1e-12)
+
+    // Leading principal component is '1' vector
+    val firstValue = pca.pc.values(0)
+    pca.pc.values.slice(0, 100000).map(values =>
+      assert(values ~== firstValue relTol 1e-12))
   }
 }

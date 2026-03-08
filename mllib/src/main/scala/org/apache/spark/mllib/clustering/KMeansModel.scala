@@ -17,7 +17,7 @@
 
 package org.apache.spark.mllib.clustering
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.json4s._
 import org.json4s.JsonDSL._
@@ -31,24 +31,45 @@ import org.apache.spark.mllib.pmml.PMMLExportable
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A clustering model for K-means. Each point belongs to the cluster with the closest center.
  */
 @Since("0.8.0")
-class KMeansModel @Since("2.4.0") (@Since("1.0.0") val clusterCenters: Array[Vector],
-  @Since("2.4.0") val distanceMeasure: String)
+class KMeansModel (@Since("1.0.0") val clusterCenters: Array[Vector],
+  @Since("2.4.0") val distanceMeasure: String,
+  @Since("2.4.0") val trainingCost: Double,
+  private[spark] val numIter: Int)
   extends Saveable with Serializable with PMMLExportable {
 
-  private val distanceMeasureInstance: DistanceMeasure =
+  @transient private lazy val distanceMeasureInstance: DistanceMeasure =
     DistanceMeasure.decodeFromString(distanceMeasure)
 
-  private val clusterCentersWithNorm =
+  @transient private lazy val clusterCentersWithNorm =
     if (clusterCenters == null) null else clusterCenters.map(new VectorWithNorm(_))
+
+  // TODO: computation of statistics may take seconds, so save it to KMeansModel in training
+  @transient private lazy val statistics = if (clusterCenters == null) {
+    None
+  } else {
+    val k = clusterCenters.length
+    val numFeatures = clusterCenters.head.size
+    if (DistanceMeasure.shouldComputeStatistics(k) &&
+        DistanceMeasure.shouldComputeStatisticsLocally(k, numFeatures)) {
+      Some(distanceMeasureInstance.computeStatistics(clusterCentersWithNorm))
+    } else {
+      None
+    }
+  }
+
+  @Since("2.4.0")
+  private[spark] def this(clusterCenters: Array[Vector], distanceMeasure: String) =
+    this(clusterCenters: Array[Vector], distanceMeasure, 0.0, -1)
 
   @Since("1.1.0")
   def this(clusterCenters: Array[Vector]) =
-    this(clusterCenters: Array[Vector], DistanceMeasure.EUCLIDEAN)
+    this(clusterCenters: Array[Vector], DistanceMeasure.EUCLIDEAN, 0.0, -1)
 
   /**
    * A Java-friendly constructor that takes an Iterable of Vectors.
@@ -67,7 +88,8 @@ class KMeansModel @Since("2.4.0") (@Since("1.0.0") val clusterCenters: Array[Vec
    */
   @Since("0.8.0")
   def predict(point: Vector): Int = {
-    distanceMeasureInstance.findClosest(clusterCentersWithNorm, new VectorWithNorm(point))._1
+    distanceMeasureInstance.findClosest(clusterCentersWithNorm, statistics,
+      new VectorWithNorm(point))._1
   }
 
   /**
@@ -76,8 +98,10 @@ class KMeansModel @Since("2.4.0") (@Since("1.0.0") val clusterCenters: Array[Vec
   @Since("1.0.0")
   def predict(points: RDD[Vector]): RDD[Int] = {
     val bcCentersWithNorm = points.context.broadcast(clusterCentersWithNorm)
+    val bcStatistics = points.context.broadcast(statistics)
     points.map(p =>
-      distanceMeasureInstance.findClosest(bcCentersWithNorm.value, new VectorWithNorm(p))._1)
+      distanceMeasureInstance.findClosest(bcCentersWithNorm.value,
+        bcStatistics.value, new VectorWithNorm(p))._1)
   }
 
   /**
@@ -97,7 +121,7 @@ class KMeansModel @Since("2.4.0") (@Since("1.0.0") val clusterCenters: Array[Vec
     val cost = data.map(p =>
       distanceMeasureInstance.pointCost(bcCentersWithNorm.value, new VectorWithNorm(p)))
       .sum()
-    bcCentersWithNorm.destroy(blocking = false)
+    bcCentersWithNorm.destroy()
     cost
   }
 
@@ -106,8 +130,6 @@ class KMeansModel @Since("2.4.0") (@Since("1.0.0") val clusterCenters: Array[Vec
   override def save(sc: SparkContext, path: String): Unit = {
     KMeansModel.SaveLoadV2_0.save(sc, this, path)
   }
-
-  override protected def formatVersion: String = "1.0"
 }
 
 @Since("1.4.0")
@@ -131,9 +153,9 @@ object KMeansModel extends Loader[KMeansModel] {
     }
   }
 
-  private case class Cluster(id: Int, point: Vector)
+  private[KMeansModel] case class Cluster(id: Int, point: Vector)
 
-  private object Cluster {
+  private[KMeansModel] object Cluster {
     def apply(r: Row): Cluster = {
       Cluster(r.getInt(0), r.getAs[Vector](1))
     }
@@ -150,15 +172,16 @@ object KMeansModel extends Loader[KMeansModel] {
       val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
       val metadata = compact(render(
         ("class" -> thisClassName) ~ ("version" -> thisFormatVersion) ~ ("k" -> model.k)))
-      sc.parallelize(Seq(metadata), 1).saveAsTextFile(Loader.metadataPath(path))
-      val dataRDD = sc.parallelize(model.clusterCentersWithNorm.zipWithIndex).map { case (p, id) =>
-        Cluster(id, p.vector)
-      }
+      spark.createDataFrame(Seq(Tuple1(metadata))).write.text(Loader.metadataPath(path))
+      val dataRDD = sc.parallelize(model.clusterCentersWithNorm.zipWithIndex.toImmutableArraySeq)
+        .map { case (p, id) =>
+          Cluster(id, p.vector)
+        }
       spark.createDataFrame(dataRDD).write.parquet(Loader.dataPath(path))
     }
 
     def load(sc: SparkContext, path: String): KMeansModel = {
-      implicit val formats = DefaultFormats
+      implicit val formats: Formats = DefaultFormats
       val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
       val (className, formatVersion, metadata) = Loader.loadMetadata(sc, path)
       assert(className == thisClassName)
@@ -182,16 +205,18 @@ object KMeansModel extends Loader[KMeansModel] {
       val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
       val metadata = compact(render(
         ("class" -> thisClassName) ~ ("version" -> thisFormatVersion)
-         ~ ("k" -> model.k) ~ ("distanceMeasure" -> model.distanceMeasure)))
-      sc.parallelize(Seq(metadata), 1).saveAsTextFile(Loader.metadataPath(path))
-      val dataRDD = sc.parallelize(model.clusterCentersWithNorm.zipWithIndex).map { case (p, id) =>
-        Cluster(id, p.vector)
-      }
+         ~ ("k" -> model.k) ~ ("distanceMeasure" -> model.distanceMeasure)
+         ~ ("trainingCost" -> model.trainingCost)))
+      spark.createDataFrame(Seq(Tuple1(metadata))).write.text(Loader.metadataPath(path))
+      val dataRDD = sc.parallelize(model.clusterCentersWithNorm.zipWithIndex.toImmutableArraySeq)
+        .map { case (p, id) =>
+          Cluster(id, p.vector)
+        }
       spark.createDataFrame(dataRDD).write.parquet(Loader.dataPath(path))
     }
 
     def load(sc: SparkContext, path: String): KMeansModel = {
-      implicit val formats = DefaultFormats
+      implicit val formats: Formats = DefaultFormats
       val spark = SparkSession.builder().sparkContext(sc).getOrCreate()
       val (className, formatVersion, metadata) = Loader.loadMetadata(sc, path)
       assert(className == thisClassName)
@@ -202,7 +227,8 @@ object KMeansModel extends Loader[KMeansModel] {
       val localCentroids = centroids.rdd.map(Cluster.apply).collect()
       assert(k == localCentroids.length)
       val distanceMeasure = (metadata \ "distanceMeasure").extract[String]
-      new KMeansModel(localCentroids.sortBy(_.id).map(_.point), distanceMeasure)
+      val trainingCost = (metadata \ "trainingCost").extract[Double]
+      new KMeansModel(localCentroids.sortBy(_.id).map(_.point), distanceMeasure, trainingCost, -1)
     }
   }
 }

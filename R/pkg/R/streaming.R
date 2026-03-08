@@ -93,7 +93,7 @@ setMethod("explain",
 
 #' lastProgress
 #'
-#' Prints the most recent progess update of this streaming query in JSON format.
+#' Prints the most recent progress update of this streaming query in JSON format.
 #'
 #' @param x a StreamingQuery.
 #' @rdname lastProgress
@@ -163,7 +163,7 @@ setMethod("isActive",
 #'
 #' @param x a StreamingQuery.
 #' @param timeout time to wait in milliseconds, if omitted, wait indefinitely until \code{stopQuery}
-#'                is called or an error has occured.
+#'                is called or an error has occurred.
 #' @return TRUE if query has terminated within the timeout period; nothing if timeout is not
 #'         specified.
 #' @rdname awaitTermination

@@ -19,9 +19,12 @@ package org.apache.spark.sql.catalyst.util
 
 import scala.reflect.ClassTag
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{SpecializedGetters, UnsafeArrayData}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.array.ByteArrayMethods
 
 object ArrayData {
   def toArrayData(input: Any): ArrayData = input match {
@@ -33,6 +36,29 @@ object ArrayData {
     case a: Array[Float] => UnsafeArrayData.fromPrimitiveArray(a)
     case a: Array[Double] => UnsafeArrayData.fromPrimitiveArray(a)
     case other => new GenericArrayData(other)
+  }
+
+
+  /**
+   * Allocate [[UnsafeArrayData]] or [[GenericArrayData]] based on given parameters.
+   *
+   * @param elementSize a size of an element in bytes. If less than zero, the type of an element is
+   *                    non-primitive type
+   * @param numElements the number of elements the array should contain
+   * @param additionalErrorMessage string to include in the error message
+   */
+  def allocateArrayData(
+      elementSize: Int,
+      numElements: Long,
+      additionalErrorMessage: String): ArrayData = {
+    if (elementSize >= 0 && !UnsafeArrayData.shouldUseGenericArrayData(elementSize, numElements)) {
+      UnsafeArrayData.createFreshArray(numElements.toInt, elementSize)
+    } else if (numElements <= ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH.toLong) {
+      new GenericArrayData(new Array[Any](numElements.toInt))
+    } else {
+      throw QueryExecutionErrors.cannotCreateArrayWithElementsExceedLimitError(
+        numElements, additionalErrorMessage)
+    }
   }
 }
 
@@ -145,11 +171,7 @@ abstract class ArrayData extends SpecializedGetters with Serializable {
     val values = new Array[T](size)
     var i = 0
     while (i < size) {
-      if (isNullAt(i)) {
-        values(i) = null.asInstanceOf[T]
-      } else {
-        values(i) = accessor(this, i).asInstanceOf[T]
-      }
+      values(i) = accessor(this, i).asInstanceOf[T]
       i += 1
     }
     values
@@ -160,11 +182,7 @@ abstract class ArrayData extends SpecializedGetters with Serializable {
     val accessor = InternalRow.getAccessor(elementType)
     var i = 0
     while (i < size) {
-      if (isNullAt(i)) {
-        f(i, null)
-      } else {
-        f(i, accessor(this, i))
-      }
+      f(i, accessor(this, i))
       i += 1
     }
   }
@@ -181,13 +199,9 @@ class ArrayDataIndexedSeq[T](arrayData: ArrayData, dataType: DataType) extends I
 
   override def apply(idx: Int): T =
     if (0 <= idx && idx < arrayData.numElements()) {
-      if (arrayData.isNullAt(idx)) {
-        null.asInstanceOf[T]
-      } else {
-        accessor(arrayData, idx).asInstanceOf[T]
-      }
+      accessor(arrayData, idx).asInstanceOf[T]
     } else {
-      throw new IndexOutOfBoundsException(
+      throw SparkException.internalError(
         s"Index $idx must be between 0 and the length of the ArrayData.")
     }
 

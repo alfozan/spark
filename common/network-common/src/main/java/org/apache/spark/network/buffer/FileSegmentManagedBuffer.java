@@ -26,9 +26,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 
-import com.google.common.base.Objects;
-import com.google.common.io.ByteStreams;
 import io.netty.channel.DefaultFileRegion;
+import io.netty.handler.stream.ChunkedStream;
 
 import org.apache.spark.network.util.JavaUtils;
 import org.apache.spark.network.util.LimitedInputStream;
@@ -77,16 +76,16 @@ public final class FileSegmentManagedBuffer extends ManagedBuffer {
         return channel.map(FileChannel.MapMode.READ_ONLY, offset, length);
       }
     } catch (IOException e) {
+      String errorMessage = "Error in reading " + this;
       try {
         if (channel != null) {
           long size = channel.size();
-          throw new IOException("Error in reading " + this + " (actual file length " + size + ")",
-            e);
+          errorMessage = "Error in reading " + this + " (actual file length " + size + ")";
         }
       } catch (IOException ignored) {
         // ignore
       }
-      throw new IOException("Error in opening " + this, e);
+      throw new IOException(errorMessage, e);
     } finally {
       JavaUtils.closeQuietly(channel);
     }
@@ -95,26 +94,24 @@ public final class FileSegmentManagedBuffer extends ManagedBuffer {
   @Override
   public InputStream createInputStream() throws IOException {
     FileInputStream is = null;
+    boolean shouldClose = true;
     try {
       is = new FileInputStream(file);
-      ByteStreams.skipFully(is, offset);
-      return new LimitedInputStream(is, length);
+      is.skipNBytes(offset);
+      InputStream r = new LimitedInputStream(is, length);
+      shouldClose = false;
+      return r;
     } catch (IOException e) {
-      try {
-        if (is != null) {
-          long size = file.length();
-          throw new IOException("Error in reading " + this + " (actual file length " + size + ")",
-              e);
-        }
-      } catch (IOException ignored) {
-        // ignore
-      } finally {
+      String errorMessage = "Error in reading " + this;
+      if (is != null) {
+        long size = file.length();
+        errorMessage = "Error in reading " + this + " (actual file length " + size + ")";
+      }
+      throw new IOException(errorMessage, e);
+    } finally {
+      if (shouldClose) {
         JavaUtils.closeQuietly(is);
       }
-      throw new IOException("Error in opening " + this, e);
-    } catch (RuntimeException e) {
-      JavaUtils.closeQuietly(is);
-      throw e;
     }
   }
 
@@ -138,6 +135,12 @@ public final class FileSegmentManagedBuffer extends ManagedBuffer {
     }
   }
 
+  @Override
+  public Object convertToNettyForSsl() throws IOException {
+    // Cannot use zero-copy with HTTPS
+    return new ChunkedStream(createInputStream(), conf.sslShuffleChunkSize());
+  }
+
   public File getFile() { return file; }
 
   public long getOffset() { return offset; }
@@ -146,10 +149,7 @@ public final class FileSegmentManagedBuffer extends ManagedBuffer {
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("file", file)
-      .add("offset", offset)
-      .add("length", length)
-      .toString();
+    return "FileSegmentManagedBuffer[file=" + file + ",offset=" + offset +
+        ",length=" + length + "]";
   }
 }

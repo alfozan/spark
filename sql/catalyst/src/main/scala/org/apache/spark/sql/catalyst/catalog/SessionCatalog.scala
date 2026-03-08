@@ -19,31 +19,56 @@ package org.apache.spark.sql.catalyst.catalog
 
 import java.net.URI
 import java.util.Locale
-import java.util.concurrent.Callable
+import java.util.concurrent.{Callable, ExecutionException, TimeUnit}
 import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
 
 import com.google.common.cache.{Cache, CacheBuilder}
+import com.google.common.util.concurrent.UncheckedExecutionException
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 
+import org.apache.spark.{SparkException, SparkThrowable}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst._
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FunctionBuilder
-import org.apache.spark.sql.catalyst.expressions.{Expression, ExpressionInfo}
+import org.apache.spark.sql.catalyst.analysis.TableFunctionRegistry.TableFunctionBuilder
+import org.apache.spark.sql.catalyst.catalog.SQLFunction.parseDefault
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, Cast, Expression, ExpressionInfo, LateralSubquery, NamedArgumentExpression, NamedExpression, OuterReference, ScalarSubquery, UpCast}
+import org.apache.spark.sql.catalyst.expressions.NamedLambdaVariable
+import org.apache.spark.sql.catalyst.expressions.UnresolvedNamedLambdaVariable
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, SubqueryAlias, View}
-import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical.{FunctionSignature, InputParameter, LateralJoin, LogicalPlan, NamedParametersSupport, OneRowRelation, Project, SubqueryAlias, View}
+import org.apache.spark.sql.catalyst.trees.CurrentOrigin
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, StringUtils}
+import org.apache.spark.sql.connector.catalog.CatalogManager
+import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
+import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.internal.StaticSQLConf.GLOBAL_TEMP_DATABASE
+import org.apache.spark.sql.internal.connector.V1Function
+import org.apache.spark.sql.metricview.util.MetricViewPlanner
+import org.apache.spark.sql.types.{MetadataBuilder, StructField, StructType}
+import org.apache.spark.sql.util.{CaseInsensitiveStringMap, PartitioningUtils}
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 object SessionCatalog {
   val DEFAULT_DATABASE = "default"
+
+  /**
+   * Kind of session-scoped function namespace for lookup/resolve.
+   * Used by the kind-based API to avoid separate methods per
+   * (builtin/temp) x (lookup/resolve) x (scalar/table).
+   */
+  sealed trait SessionFunctionKind
+  case object Builtin extends SessionFunctionKind
+  case object Temp extends SessionFunctionKind
 }
 
 /**
@@ -57,49 +82,242 @@ class SessionCatalog(
     externalCatalogBuilder: () => ExternalCatalog,
     globalTempViewManagerBuilder: () => GlobalTempViewManager,
     functionRegistry: FunctionRegistry,
-    conf: SQLConf,
+    tableFunctionRegistry: TableFunctionRegistry,
     hadoopConf: Configuration,
-    parser: ParserInterface,
-    functionResourceLoader: FunctionResourceLoader) extends Logging {
+    val parser: ParserInterface,
+    functionResourceLoader: FunctionResourceLoader,
+    functionExpressionBuilder: FunctionExpressionBuilder,
+    cacheSize: Int = SQLConf.get.tableRelationCacheSize,
+    cacheTTL: Long = SQLConf.get.metadataCacheTTL,
+    defaultDatabase: String = SQLConf.get.defaultDatabase) extends SQLConfHelper with Logging {
   import SessionCatalog._
   import CatalogTypes.TablePartitionSpec
+
+  /**
+   * Database qualifier used to store temporary functions in the function registry.
+   * Temporary functions use composite keys to coexist with builtin functions of the same name:
+   * - Builtin functions (including extensions): FunctionIdentifier(name, None)
+   * - Temp functions: FunctionIdentifier(name, Some(CatalogManager.SESSION_NAMESPACE))
+   */
+  private val TEMP_FUNCTION_DB = CatalogManager.SESSION_NAMESPACE
+
+  /**
+   * Creates a FunctionIdentifier for a temporary function with the TEMP_FUNCTION_DB database
+   * qualifier. This enables temporary functions to coexist with builtin functions of the same name.
+   */
+  private def tempFunctionIdentifier(name: String): FunctionIdentifier =
+    FunctionIdentifier(
+      format(name),
+      Some(TEMP_FUNCTION_DB),
+      Some(CatalogManager.SYSTEM_CATALOG_NAME))
+
+  /**
+   * Checks if a FunctionIdentifier represents a temporary function by checking for the
+   * TEMP_FUNCTION_DB database qualifier.
+   */
+  private def isTempFunctionIdentifier(identifier: FunctionIdentifier): Boolean =
+    identifier.database.contains(TEMP_FUNCTION_DB)
+
+  // --------------------------------
+  // | PATH-Based Resolution        |
+  // --------------------------------
+  // Functions are resolved by searching through an ordered PATH of namespaces.
+  // This provides a unified, data-driven resolution mechanism instead of hardcoded checks.
+
+  /**
+   * Function resolution PATH - ordered list of namespaces to search for unqualified functions.
+   * Each entry is a FunctionIdentifier representing a namespace (catalog + database).
+   * The funcName field is unused (empty string) as these represent namespace templates.
+   *
+   * Resolution order follows the configured path: builtin then session (default "second"),
+   * or session then builtin (legacy "first"), or builtin only ("last" - session tried after
+   * persistent in FunctionResolution).
+   *
+   * When resolving a view, the system.session namespace is included in the path, but
+   * handleViewContext filters to only return temporary functions that were referred to
+   * when the view was created.
+   *
+   * These identifiers are cached for performance since they're accessed frequently.
+   */
+  private val SESSION_NAMESPACE_TEMPLATE = FunctionIdentifier(
+    funcName = "",
+    database = Some(CatalogManager.SESSION_NAMESPACE),
+    catalog = Some(CatalogManager.SYSTEM_CATALOG_NAME))
+
+  private val BUILTIN_NAMESPACE_TEMPLATE = FunctionIdentifier(
+    funcName = "",
+    database = Some(CatalogManager.BUILTIN_NAMESPACE),
+    catalog = Some(CatalogManager.SYSTEM_CATALOG_NAME))
+
+  // The resolution path: builtin -> session (session "second")
+  private val RESOLUTION_PATH = Seq(
+    BUILTIN_NAMESPACE_TEMPLATE,
+    SESSION_NAMESPACE_TEMPLATE
+  )
+
+  // Legacy resolution path: session -> builtin (session "first")
+  private val LEGACY_RESOLUTION_PATH = Seq(
+    SESSION_NAMESPACE_TEMPLATE,
+    BUILTIN_NAMESPACE_TEMPLATE
+  )
+
+  // Session last: only builtin (session tried after persistent in FunctionResolution)
+  private val SESSION_LAST_RESOLUTION_PATH = Seq(BUILTIN_NAMESPACE_TEMPLATE)
+
+  /**
+   * Returns the resolution path for function lookup.
+   * @return Ordered sequence of namespace identifiers.
+   */
+  private def resolutionPath(): Seq[FunctionIdentifier] = {
+    conf.sessionFunctionResolutionOrder match {
+      case "first" => LEGACY_RESOLUTION_PATH
+      case "last" => SESSION_LAST_RESOLUTION_PATH
+      case _ => RESOLUTION_PATH // "second" (default)
+    }
+  }
+
+  /**
+   * Maps a namespace template to an actual storage identifier for a specific function.
+   *
+   * Storage conventions:
+   * - Builtin functions: FunctionIdentifier(name, None, None)
+   * - Temp functions: FunctionIdentifier(name, Some("session"), Some("system"))
+   * - Other: FunctionIdentifier(name, namespace.database, namespace.catalog)
+   */
+  private def namespaceToIdentifier(
+      namespace: FunctionIdentifier,
+      name: String): FunctionIdentifier = {
+    namespace.database match {
+      case Some(CatalogManager.BUILTIN_NAMESPACE) =>
+        FunctionIdentifier(format(name))
+
+      case _ =>
+        namespace.copy(funcName = name)
+    }
+  }
+
+  /**
+   * Checks if a namespace represents temporary functions.
+   */
+  private def isSessionNamespace(namespace: FunctionIdentifier): Boolean = {
+    namespace.database.contains(CatalogManager.SESSION_NAMESPACE)
+  }
+
+  /**
+   * Lookup a function in a specific namespace.
+   *
+   * @param namespace Namespace identifier (catalog + database)
+   * @param name Function name (unqualified)
+   * @param registry The registry to search (FunctionRegistry or TableFunctionRegistry)
+   * @tparam T The registry's type parameter (Expression or LogicalPlan)
+   * @return ExpressionInfo if function found in this namespace
+   */
+  private def lookupInNamespace[T](
+      namespace: FunctionIdentifier,
+      name: String,
+      registry: FunctionRegistryBase[T]): Option[ExpressionInfo] = {
+
+    val identifier = namespaceToIdentifier(namespace, name)
+    val result = registry.lookupFunction(identifier)
+
+    // Apply view context filtering for temp functions
+    if (isSessionNamespace(namespace)) {
+      handleViewContext(name, result)
+    } else {
+      result
+    }
+  }
+
+  /**
+   * Resolve a function in a specific namespace by building it with arguments.
+   *
+   * @param namespace Namespace identifier (catalog + database)
+   * @param name Function name (unqualified)
+   * @param arguments Arguments to pass to the function builder
+   * @param registry The registry to search
+   * @tparam T The registry's type parameter
+   * @return Built function instance if found
+   */
+  private def resolveInNamespace[T](
+      namespace: FunctionIdentifier,
+      name: String,
+      arguments: Seq[Expression],
+      registry: FunctionRegistryBase[T]): Option[T] = {
+
+    val identifier = namespaceToIdentifier(namespace, name)
+
+    if (!registry.functionExists(identifier)) {
+      None
+    } else if (isSessionNamespace(namespace)) {
+      // For temp functions, apply view context handling
+      handleViewContext(name, Option(registry.lookupFunction(identifier, arguments)))
+    } else {
+      Some(registry.lookupFunction(identifier, arguments))
+    }
+  }
 
   // For testing only.
   def this(
       externalCatalog: ExternalCatalog,
       functionRegistry: FunctionRegistry,
-      conf: SQLConf) {
+      tableFunctionRegistry: TableFunctionRegistry,
+      conf: SQLConf) = {
     this(
       () => externalCatalog,
-      () => new GlobalTempViewManager("global_temp"),
+      () => new GlobalTempViewManager(conf.getConf(GLOBAL_TEMP_DATABASE)),
       functionRegistry,
-      conf,
+      tableFunctionRegistry,
       new Configuration(),
-      new CatalystSqlParser(conf),
-      DummyFunctionResourceLoader)
+      new CatalystSqlParser(),
+      DummyFunctionResourceLoader,
+      DummyFunctionExpressionBuilder,
+      conf.tableRelationCacheSize,
+      conf.metadataCacheTTL,
+      conf.defaultDatabase)
   }
 
   // For testing only.
-  def this(externalCatalog: ExternalCatalog) {
-    this(
-      externalCatalog,
-      new SimpleFunctionRegistry,
-      new SQLConf().copy(SQLConf.CASE_SENSITIVE -> true))
+  def this(
+      externalCatalog: ExternalCatalog,
+      functionRegistry: FunctionRegistry,
+      conf: SQLConf) = {
+    this(externalCatalog, functionRegistry, new SimpleTableFunctionRegistry, conf)
+  }
+
+  // For testing only.
+  def this(
+      externalCatalog: ExternalCatalog,
+      functionRegistry: FunctionRegistry,
+      tableFunctionRegistry: TableFunctionRegistry) = {
+    this(externalCatalog, functionRegistry, tableFunctionRegistry, SQLConf.get)
+  }
+
+  // For testing only.
+  def this(externalCatalog: ExternalCatalog, functionRegistry: FunctionRegistry) = {
+    this(externalCatalog, functionRegistry, SQLConf.get)
+  }
+
+  // For testing only.
+  def this(externalCatalog: ExternalCatalog) = {
+    this(externalCatalog, new SimpleFunctionRegistry)
   }
 
   lazy val externalCatalog = externalCatalogBuilder()
   lazy val globalTempViewManager = globalTempViewManagerBuilder()
+  val globalTempDatabase: String = SQLConf.get.globalTempDatabase
 
   /** List of temporary views, mapping from table name to their logical plan. */
   @GuardedBy("this")
-  protected val tempViews = new mutable.HashMap[String, LogicalPlan]
+  protected val tempViews = new mutable.HashMap[String, TemporaryViewRelation]
 
   // Note: we track current database here because certain operations do not explicitly
   // specify the database (e.g. DROP TABLE my_table). In these cases we must first
   // check whether the temporary view or function exists, then, if not, operate on
   // the corresponding item in the current database.
   @GuardedBy("this")
-  protected var currentDb: String = formatDatabaseName(DEFAULT_DATABASE)
+  protected var currentDb: String = format(defaultDatabase)
+
+  private val validNameFormat = "([\\w_]+)".r
 
   /**
    * Checks if the given name conforms the Hive standard ("[a-zA-Z_0-9]+"),
@@ -109,35 +327,76 @@ class SessionCatalog(
    * org.apache.hadoop.hive.metastore.MetaStoreUtils.validateName.
    */
   private def validateName(name: String): Unit = {
-    val validNameFormat = "([\\w_]+)".r
     if (!validNameFormat.pattern.matcher(name).matches()) {
-      throw new AnalysisException(s"`$name` is not a valid name for tables/databases. " +
-        "Valid names only contain alphabet characters, numbers and _.")
+      throw QueryCompilationErrors.invalidNameForTableOrDatabaseError(name)
     }
   }
 
   /**
-   * Format table name, taking into account case sensitivity.
+   * Formats object names, taking into account case sensitivity.
    */
-  protected[this] def formatTableName(name: String): String = {
+  protected def format(name: String): String = {
     if (conf.caseSensitiveAnalysis) name else name.toLowerCase(Locale.ROOT)
   }
 
   /**
-   * Format database name, taking into account case sensitivity.
+   * Qualifies the table identifier with the current database if not specified, and normalize all
+   * the names.
    */
-  protected[this] def formatDatabaseName(name: String): String = {
-    if (conf.caseSensitiveAnalysis) name else name.toLowerCase(Locale.ROOT)
+  def qualifyIdentifier(ident: TableIdentifier): TableIdentifier = {
+    TableIdentifier(
+      table = format(ident.table),
+      database = getDatabase(ident),
+      catalog = getCatalog(ident))
+  }
+
+  /**
+   * Qualifies the function identifier with the current database if not specified, and normalize all
+   * the names.
+   */
+  def qualifyIdentifier(ident: FunctionIdentifier): FunctionIdentifier = {
+    FunctionIdentifier(
+      funcName = format(ident.funcName),
+      database = getDatabase(ident),
+      catalog = getCatalog(ident))
+  }
+
+  private def attachCatalogName(table: CatalogTable): CatalogTable = {
+    table.copy(identifier = table.identifier.copy(catalog = getCatalog(table.identifier)))
+  }
+
+  private def getDatabase(ident: CatalystIdentifier): Option[String] = {
+    Some(format(ident.database.getOrElse(getCurrentDatabase)))
+  }
+
+  private def getCatalog(ident: CatalystIdentifier): Option[String] = {
+    if (conf.getConf(SQLConf.LEGACY_NON_IDENTIFIER_OUTPUT_CATALOG_NAME)) {
+      ident.catalog
+    } else {
+      Some(format(ident.catalog.getOrElse(CatalogManager.SESSION_CATALOG_NAME)))
+    }
   }
 
   private val tableRelationCache: Cache[QualifiedTableName, LogicalPlan] = {
-    val cacheSize = conf.tableRelationCacheSize
-    CacheBuilder.newBuilder().maximumSize(cacheSize).build[QualifiedTableName, LogicalPlan]()
+    var builder = CacheBuilder.newBuilder()
+      .maximumSize(cacheSize)
+
+    if (cacheTTL > 0) {
+      builder = builder.expireAfterWrite(cacheTTL, TimeUnit.SECONDS)
+    }
+
+    builder.build[QualifiedTableName, LogicalPlan]()
   }
 
   /** This method provides a way to get a cached plan. */
   def getCachedPlan(t: QualifiedTableName, c: Callable[LogicalPlan]): LogicalPlan = {
-    tableRelationCache.get(t, c)
+    try {
+      tableRelationCache.get(t, c)
+    } catch {
+      case e @ (_: ExecutionException | _: UncheckedExecutionException)
+          if e.getCause != null && e.getCause.isInstanceOf[SparkThrowable] =>
+        throw e.getCause
+    }
   }
 
   /** This method provides a way to get a cached plan if the key exists. */
@@ -155,6 +414,13 @@ class SessionCatalog(
     tableRelationCache.invalidate(key)
   }
 
+  /** This method discards any cached table relation plans for the given table identifier. */
+  def invalidateCachedTable(name: TableIdentifier): Unit = {
+    val qualified = qualifyIdentifier(name)
+    invalidateCachedTable(QualifiedTableName(
+      qualified.catalog.get, qualified.database.get, qualified.table))
+  }
+
   /** This method provides a way to invalidate all the cached plans. */
   def invalidateAllCachedTables(): Unit = {
     tableRelationCache.invalidateAll()
@@ -167,28 +433,25 @@ class SessionCatalog(
    * FileSystem is changed.
    */
   private def makeQualifiedPath(path: URI): URI = {
-    val hadoopPath = new Path(path)
-    val fs = hadoopPath.getFileSystem(hadoopConf)
-    fs.makeQualified(hadoopPath).toUri
+    CatalogUtils.makeQualifiedPath(path, hadoopConf)
   }
 
   private def requireDbExists(db: String): Unit = {
     if (!databaseExists(db)) {
-      throw new NoSuchDatabaseException(db)
+      throw new NoSuchNamespaceException(Seq(CatalogManager.SESSION_CATALOG_NAME, db))
     }
   }
 
   private def requireTableExists(name: TableIdentifier): Unit = {
     if (!tableExists(name)) {
-      val db = name.database.getOrElse(currentDb)
-      throw new NoSuchTableException(db = db, table = name.table)
+      throw new NoSuchTableException(
+        Seq(name.catalog.get, name.database.get, name.table))
     }
   }
 
   private def requireTableNotExists(name: TableIdentifier): Unit = {
     if (tableExists(name)) {
-      val db = name.database.getOrElse(currentDb)
-      throw new TableAlreadyExistsException(db = db, table = name.table)
+      throw new TableAlreadyExistsException(db = name.database.get, table = name.table)
     }
   }
 
@@ -199,41 +462,53 @@ class SessionCatalog(
   // ----------------------------------------------------------------------------
 
   def createDatabase(dbDefinition: CatalogDatabase, ignoreIfExists: Boolean): Unit = {
-    val dbName = formatDatabaseName(dbDefinition.name)
-    if (dbName == globalTempViewManager.database) {
-      throw new AnalysisException(
-        s"${globalTempViewManager.database} is a system preserved database, " +
-          "you cannot create a database with this name.")
+    val dbName = format(dbDefinition.name)
+    if (dbName == globalTempDatabase) {
+      throw QueryCompilationErrors.cannotCreateDatabaseWithSameNameAsPreservedDatabaseError(
+        globalTempDatabase)
     }
     validateName(dbName)
-    val qualifiedPath = makeQualifiedPath(dbDefinition.locationUri)
     externalCatalog.createDatabase(
-      dbDefinition.copy(name = dbName, locationUri = qualifiedPath),
+      dbDefinition.copy(name = dbName, locationUri = makeQualifiedDBPath(dbDefinition.locationUri)),
       ignoreIfExists)
   }
 
+  private def makeQualifiedDBPath(locationUri: URI): URI = {
+    CatalogUtils.makeQualifiedDBObjectPath(locationUri, conf.warehousePath, hadoopConf)
+  }
+
   def dropDatabase(db: String, ignoreIfNotExists: Boolean, cascade: Boolean): Unit = {
-    val dbName = formatDatabaseName(db)
+    val dbName = format(db)
     if (dbName == DEFAULT_DATABASE) {
-      throw new AnalysisException(s"Can not drop default database")
+      throw QueryCompilationErrors.cannotDropDefaultDatabaseError(
+        Seq(CatalogManager.SESSION_CATALOG_NAME, dbName))
+    }
+    if (!ignoreIfNotExists) {
+      requireDbExists(dbName)
+    }
+    if (cascade && databaseExists(dbName)) {
+      listTables(dbName).foreach { t =>
+        invalidateCachedTable(QualifiedTableName(SESSION_CATALOG_NAME, dbName, t.table))
+      }
     }
     externalCatalog.dropDatabase(dbName, ignoreIfNotExists, cascade)
   }
 
   def alterDatabase(dbDefinition: CatalogDatabase): Unit = {
-    val dbName = formatDatabaseName(dbDefinition.name)
+    val dbName = format(dbDefinition.name)
     requireDbExists(dbName)
-    externalCatalog.alterDatabase(dbDefinition.copy(name = dbName))
+    externalCatalog.alterDatabase(dbDefinition.copy(
+      name = dbName, locationUri = makeQualifiedDBPath(dbDefinition.locationUri)))
   }
 
   def getDatabaseMetadata(db: String): CatalogDatabase = {
-    val dbName = formatDatabaseName(db)
+    val dbName = format(db)
     requireDbExists(dbName)
     externalCatalog.getDatabase(dbName)
   }
 
   def databaseExists(db: String): Boolean = {
-    val dbName = formatDatabaseName(db)
+    val dbName = format(db)
     externalCatalog.databaseExists(dbName)
   }
 
@@ -248,15 +523,16 @@ class SessionCatalog(
   def getCurrentDatabase: String = synchronized { currentDb }
 
   def setCurrentDatabase(db: String): Unit = {
-    val dbName = formatDatabaseName(db)
-    if (dbName == globalTempViewManager.database) {
-      throw new AnalysisException(
-        s"${globalTempViewManager.database} is a system preserved database, " +
-          "you cannot use it as current database. To access global temporary views, you should " +
-          "use qualified name with the GLOBAL_TEMP_DATABASE, e.g. SELECT * FROM " +
-          s"${globalTempViewManager.database}.viewName.")
+    setCurrentDatabaseWithNameCheck(db, requireDbExists)
+  }
+
+  def setCurrentDatabaseWithNameCheck(db: String, nameCheck: String => Unit): Unit = {
+    val dbName = format(db)
+    if (dbName == globalTempDatabase) {
+      throw QueryCompilationErrors.cannotUsePreservedDatabaseAsCurrentDatabaseError(
+        globalTempDatabase)
     }
-    requireDbExists(dbName)
+    nameCheck(dbName)
     synchronized { currentDb = dbName }
   }
 
@@ -265,8 +541,7 @@ class SessionCatalog(
    * by users.
    */
   def getDefaultDBPath(db: String): URI = {
-    val database = formatDatabaseName(db)
-    new Path(new Path(conf.warehousePath), database + ".db").toUri
+    CatalogUtils.stringToURI(format(db) + ".db")
   }
 
   // ----------------------------------------------------------------------------
@@ -290,21 +565,26 @@ class SessionCatalog(
       tableDefinition: CatalogTable,
       ignoreIfExists: Boolean,
       validateLocation: Boolean = true): Unit = {
-    val db = formatDatabaseName(tableDefinition.identifier.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableDefinition.identifier.table)
-    val tableIdentifier = TableIdentifier(table, Some(db))
+    val isExternal = tableDefinition.tableType == CatalogTableType.EXTERNAL
+    if (isExternal && tableDefinition.storage.locationUri.isEmpty) {
+      throw QueryCompilationErrors.createExternalTableWithoutLocationError()
+    }
+
+    val qualifiedIdent = qualifyIdentifier(tableDefinition.identifier)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
     validateName(table)
 
     val newTableDefinition = if (tableDefinition.storage.locationUri.isDefined
       && !tableDefinition.storage.locationUri.get.isAbsolute) {
       // make the location of the table qualified.
       val qualifiedTableLocation =
-        makeQualifiedPath(tableDefinition.storage.locationUri.get)
+        makeQualifiedTablePath(tableDefinition.storage.locationUri.get, db)
       tableDefinition.copy(
         storage = tableDefinition.storage.copy(locationUri = Some(qualifiedTableLocation)),
-        identifier = tableIdentifier)
+        identifier = qualifiedIdent)
     } else {
-      tableDefinition.copy(identifier = tableIdentifier)
+      tableDefinition.copy(identifier = qualifiedIdent)
     }
 
     requireDbExists(db)
@@ -312,24 +592,36 @@ class SessionCatalog(
       if (!ignoreIfExists) {
         throw new TableAlreadyExistsException(db = db, table = table)
       }
-    } else if (validateLocation) {
-      validateTableLocation(newTableDefinition)
+    } else {
+      if (validateLocation) {
+        validateTableLocation(newTableDefinition)
+      }
+      externalCatalog.createTable(newTableDefinition, ignoreIfExists)
     }
-    externalCatalog.createTable(newTableDefinition, ignoreIfExists)
   }
 
   def validateTableLocation(table: CatalogTable): Unit = {
     // SPARK-19724: the default location of a managed table should be non-existent or empty.
-    if (table.tableType == CatalogTableType.MANAGED &&
-      !conf.allowCreatingManagedTableUsingNonemptyLocation) {
+    if (table.tableType == CatalogTableType.MANAGED) {
       val tableLocation =
         new Path(table.storage.locationUri.getOrElse(defaultTablePath(table.identifier)))
       val fs = tableLocation.getFileSystem(hadoopConf)
 
       if (fs.exists(tableLocation) && fs.listStatus(tableLocation).nonEmpty) {
-        throw new AnalysisException(s"Can not create the managed table('${table.identifier}')" +
-          s". The associated location('${tableLocation.toString}') already exists.")
+        throw QueryExecutionErrors.locationAlreadyExists(table.identifier, tableLocation)
       }
+    }
+  }
+
+  def makeQualifiedTablePath(locationUri: URI, database: String): URI = {
+    if (locationUri.isAbsolute) {
+      locationUri
+    } else if (new Path(locationUri).isAbsolute) {
+      makeQualifiedPath(locationUri)
+    } else {
+      val dbName = format(database)
+      val dbLocation = makeQualifiedDBPath(getDatabaseMetadata(dbName).locationUri)
+      new Path(new Path(dbLocation), CatalogUtils.URIToString(locationUri)).toUri
     }
   }
 
@@ -343,12 +635,22 @@ class SessionCatalog(
    * this becomes a no-op.
    */
   def alterTable(tableDefinition: CatalogTable): Unit = {
-    val db = formatDatabaseName(tableDefinition.identifier.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableDefinition.identifier.table)
-    val tableIdentifier = TableIdentifier(table, Some(db))
-    val newTableDefinition = tableDefinition.copy(identifier = tableIdentifier)
+    val qualifiedIdent = qualifyIdentifier(tableDefinition.identifier)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(tableIdentifier)
+    requireTableExists(qualifiedIdent)
+    val newTableDefinition = if (tableDefinition.storage.locationUri.isDefined
+      && !tableDefinition.storage.locationUri.get.isAbsolute) {
+      // make the location of the table qualified.
+      val qualifiedTableLocation =
+        makeQualifiedTablePath(tableDefinition.storage.locationUri.get, db)
+      tableDefinition.copy(
+        storage = tableDefinition.storage.copy(locationUri = Some(qualifiedTableLocation)),
+        identifier = qualifiedIdent)
+    } else {
+      tableDefinition.copy(identifier = qualifiedIdent)
+    }
+
     externalCatalog.alterTable(newTableDefinition)
   }
 
@@ -359,34 +661,54 @@ class SessionCatalog(
    *
    * @param identifier TableIdentifier
    * @param newDataSchema Updated data schema to be used for the table
+   * @deprecated since 4.1.0 use `alterTableSchema` instead.
    */
   def alterTableDataSchema(
       identifier: TableIdentifier,
       newDataSchema: StructType): Unit = {
-    val db = formatDatabaseName(identifier.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(identifier.table)
-    val tableIdentifier = TableIdentifier(table, Some(db))
+    val qualifiedIdent = qualifyIdentifier(identifier)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
     requireDbExists(db)
-    requireTableExists(tableIdentifier)
+    requireTableExists(qualifiedIdent)
 
     val catalogTable = externalCatalog.getTable(db, table)
     val oldDataSchema = catalogTable.dataSchema
     // not supporting dropping columns yet
+    val resolver = conf.resolver
     val nonExistentColumnNames =
-      oldDataSchema.map(_.name).filterNot(columnNameResolved(newDataSchema, _))
+      oldDataSchema.map(_.name).filterNot(columnNameResolved(resolver, newDataSchema, _))
     if (nonExistentColumnNames.nonEmpty) {
-      throw new AnalysisException(
-        s"""
-           |Some existing schema fields (${nonExistentColumnNames.mkString("[", ",", "]")}) are
-           |not present in the new schema. We don't support dropping columns yet.
-         """.stripMargin)
+      throw QueryCompilationErrors.dropNonExistentColumnsNotSupportedError(nonExistentColumnNames)
     }
 
     externalCatalog.alterTableDataSchema(db, table, newDataSchema)
   }
 
-  private def columnNameResolved(schema: StructType, colName: String): Boolean = {
-    schema.fields.map(_.name).exists(conf.resolver(_, colName))
+  /**
+   * Alter the schema of a table identified by the provided table identifier. All partition columns
+   * must be preserved.
+   *
+   * @param identifier TableIdentifier
+   * @param newSchema Updated schema to be used for the table
+   */
+  def alterTableSchema(
+      identifier: TableIdentifier,
+      newSchema: StructType): Unit = {
+    val qualifiedIdent = qualifyIdentifier(identifier)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
+    requireDbExists(db)
+    requireTableExists(qualifiedIdent)
+
+    externalCatalog.alterTableSchema(db, table, newSchema)
+  }
+
+  private def columnNameResolved(
+      resolver: Resolver,
+      schema: StructType,
+      colName: String): Boolean = {
+    schema.fields.exists(f => resolver(f.name, colName))
   }
 
   /**
@@ -394,38 +716,76 @@ class SessionCatalog(
    * identifier.
    */
   def alterTableStats(identifier: TableIdentifier, newStats: Option[CatalogStatistics]): Unit = {
-    val db = formatDatabaseName(identifier.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(identifier.table)
-    val tableIdentifier = TableIdentifier(table, Some(db))
+    val qualifiedIdent = qualifyIdentifier(identifier)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
     requireDbExists(db)
-    requireTableExists(tableIdentifier)
+    requireTableExists(qualifiedIdent)
     externalCatalog.alterTableStats(db, table, newStats)
     // Invalidate the table relation cache
-    refreshTable(identifier)
+    refreshTable(qualifiedIdent)
   }
 
   /**
    * Return whether a table/view with the specified name exists. If no database is specified, check
    * with current database.
    */
-  def tableExists(name: TableIdentifier): Boolean = synchronized {
-    val db = formatDatabaseName(name.database.getOrElse(currentDb))
-    val table = formatTableName(name.table)
-    externalCatalog.tableExists(db, table)
+  def tableExists(name: TableIdentifier): Boolean = {
+    val qualifiedIdent = qualifyIdentifier(name)
+    externalCatalog.tableExists(qualifiedIdent.database.get, qualifiedIdent.table)
+  }
+
+  /**
+   * Retrieve the metadata of an existing permanent table/view. If no database is specified,
+   * assume the table/view is in the current database.
+   * We replace char/varchar with "annotated" string type in the table schema, as the query
+   * engine doesn't support char/varchar yet.
+   */
+  @throws[NoSuchNamespaceException]
+  @throws[NoSuchTableException]
+  def getTableMetadata(name: TableIdentifier): CatalogTable = {
+    val t = getTableRawMetadata(name)
+    t.copy(schema = CharVarcharUtils.replaceCharVarcharWithStringInSchema(t.schema))
   }
 
   /**
    * Retrieve the metadata of an existing permanent table/view. If no database is specified,
    * assume the table/view is in the current database.
    */
-  @throws[NoSuchDatabaseException]
+  @throws[NoSuchNamespaceException]
   @throws[NoSuchTableException]
-  def getTableMetadata(name: TableIdentifier): CatalogTable = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(name.table)
-    requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Some(db)))
-    externalCatalog.getTable(db, table)
+  def getTableRawMetadata(name: TableIdentifier): CatalogTable = {
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
+    // Let the external catalog handle all error cases (db not exists, table not exists)
+    attachCatalogName(externalCatalog.getTable(db, table))
+  }
+
+  /**
+   * Retrieve all metadata of existing permanent tables/views. If no database is specified,
+   * assume the table/view is in the current database.
+   * Only the tables/views belong to the same database that can be retrieved are returned.
+   * For example, if none of the requested tables could be retrieved, an empty list is returned.
+   * There is no guarantee of ordering of the returned tables.
+   */
+  @throws[NoSuchNamespaceException]
+  def getTablesByName(names: Seq[TableIdentifier]): Seq[CatalogTable] = {
+    if (names.nonEmpty) {
+      val qualifiedIdents = names.map(qualifyIdentifier)
+      val dbs = qualifiedIdents.map(_.database.get)
+      val tables = qualifiedIdents.map(_.table)
+      if (dbs.distinct.size != 1) {
+        val qualifiedTableNames = dbs.zip(tables).map { case (d, t) => QualifiedTableName(d, t)}
+        throw QueryCompilationErrors.cannotRetrieveTableOrViewNotInSameDatabaseError(
+          qualifiedTableNames)
+      }
+      val db = dbs.head
+      requireDbExists(db)
+      externalCatalog.getTablesByName(db, tables).map(attachCatalogName)
+    } else {
+      Seq.empty
+    }
   }
 
   /**
@@ -438,10 +798,11 @@ class SessionCatalog(
       loadPath: String,
       isOverwrite: Boolean,
       isSrcLocal: Boolean): Unit = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(name.table)
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Some(db)))
+    requireTableExists(qualifiedIdent)
     externalCatalog.loadTable(db, table, loadPath, isOverwrite, isSrcLocal)
   }
 
@@ -457,20 +818,20 @@ class SessionCatalog(
       isOverwrite: Boolean,
       inheritTableSpecs: Boolean,
       isSrcLocal: Boolean): Unit = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(name.table)
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Some(db)))
+    requireTableExists(qualifiedIdent)
     requireNonEmptyValueInPartitionSpec(Seq(spec))
     externalCatalog.loadPartition(
       db, table, loadPath, spec, isOverwrite, inheritTableSpecs, isSrcLocal)
   }
 
   def defaultTablePath(tableIdent: TableIdentifier): URI = {
-    val dbName = formatDatabaseName(tableIdent.database.getOrElse(getCurrentDatabase))
-    val dbLocation = getDatabaseMetadata(dbName).locationUri
-
-    new Path(new Path(dbLocation), formatTableName(tableIdent.table)).toUri
+    val qualifiedIdent = qualifyIdentifier(tableIdent)
+    val dbLocation = getDatabaseMetadata(qualifiedIdent.database.get).locationUri
+    new Path(new Path(dbLocation), qualifiedIdent.table).toUri
   }
 
   // ----------------------------------------------
@@ -482,13 +843,13 @@ class SessionCatalog(
    */
   def createTempView(
       name: String,
-      tableDefinition: LogicalPlan,
+      viewDefinition: TemporaryViewRelation,
       overrideIfExists: Boolean): Unit = synchronized {
-    val table = formatTableName(name)
-    if (tempViews.contains(table) && !overrideIfExists) {
+    val normalized = format(name)
+    if (tempViews.contains(normalized) && !overrideIfExists) {
       throw new TempTableAlreadyExistsException(name)
     }
-    tempViews.put(table, tableDefinition)
+    tempViews.put(normalized, viewDefinition)
   }
 
   /**
@@ -496,9 +857,9 @@ class SessionCatalog(
    */
   def createGlobalTempView(
       name: String,
-      viewDefinition: LogicalPlan,
+      viewDefinition: TemporaryViewRelation,
       overrideIfExists: Boolean): Unit = {
-    globalTempViewManager.create(formatTableName(name), viewDefinition, overrideIfExists)
+    globalTempViewManager.create(format(name), viewDefinition, overrideIfExists)
   }
 
   /**
@@ -507,8 +868,8 @@ class SessionCatalog(
    */
   def alterTempViewDefinition(
       name: TableIdentifier,
-      viewDefinition: LogicalPlan): Boolean = synchronized {
-    val viewName = formatTableName(name.table)
+      viewDefinition: TemporaryViewRelation): Boolean = synchronized {
+    val viewName = format(name.table)
     if (name.database.isEmpty) {
       if (tempViews.contains(viewName)) {
         createTempView(viewName, viewDefinition, overrideIfExists = true)
@@ -516,7 +877,7 @@ class SessionCatalog(
       } else {
         false
       }
-    } else if (formatDatabaseName(name.database.get) == globalTempViewManager.database) {
+    } else if (format(name.database.get) == globalTempDatabase) {
       globalTempViewManager.update(viewName, viewDefinition)
     } else {
       false
@@ -526,15 +887,58 @@ class SessionCatalog(
   /**
    * Return a local temporary view exactly as it was stored.
    */
-  def getTempView(name: String): Option[LogicalPlan] = synchronized {
-    tempViews.get(formatTableName(name))
+  def getRawTempView(name: String): Option[TemporaryViewRelation] = synchronized {
+    tempViews.get(format(name))
+  }
+
+  /**
+   * Generate a [[View]] operator from the temporary view stored.
+   */
+  def getTempView(name: String): Option[View] = synchronized {
+    getRawTempView(name).map(getTempViewPlan)
+  }
+
+  def getTempViewNames(): Seq[String] = synchronized {
+    tempViews.keySet.toSeq
   }
 
   /**
    * Return a global temporary view exactly as it was stored.
    */
-  def getGlobalTempView(name: String): Option[LogicalPlan] = {
-    globalTempViewManager.get(formatTableName(name))
+  def getRawGlobalTempView(name: String): Option[TemporaryViewRelation] = {
+    globalTempViewManager.get(format(name))
+  }
+
+  /**
+   * Generate a [[View]] operator from the global temporary view stored.
+   */
+  def getGlobalTempView(name: String): Option[View] = {
+    getRawGlobalTempView(name).map(getTempViewPlan)
+  }
+
+  /**
+   * Generate a [[View]] operator from the local or global temporary view stored.
+   */
+  def getLocalOrGlobalTempView(name: TableIdentifier): Option[View] = {
+    getRawLocalOrGlobalTempView(toNameParts(name)).map(getTempViewPlan)
+  }
+
+  /**
+   * Generate a [[View]] operator from the local or global temporary view stored.
+   */
+  def getLocalOrGlobalTempView(name: Seq[String]): Option[View] = {
+    getRawLocalOrGlobalTempView(name).map(getTempViewPlan)
+  }
+
+  /**
+   * Return the raw logical plan of a temporary local or global view for the given name.
+   */
+  def getRawLocalOrGlobalTempView(name: Seq[String]): Option[TemporaryViewRelation] = {
+    name match {
+      case Seq(v) => getRawTempView(v)
+      case Seq(db, v) if isGlobalTempViewDB(db) => getRawGlobalTempView(v)
+      case _ => None
+    }
   }
 
   /**
@@ -543,7 +947,7 @@ class SessionCatalog(
    * Returns true if this view is dropped successfully, false otherwise.
    */
   def dropTempView(name: String): Boolean = synchronized {
-    tempViews.remove(formatTableName(name)).isDefined
+    tempViews.remove(format(name)).isDefined
   }
 
   /**
@@ -552,7 +956,23 @@ class SessionCatalog(
    * Returns true if this view is dropped successfully, false otherwise.
    */
   def dropGlobalTempView(name: String): Boolean = {
-    globalTempViewManager.remove(formatTableName(name))
+    globalTempViewManager.remove(format(name))
+  }
+
+  private def toNameParts(ident: TableIdentifier): Seq[String] = {
+    ident.database.toSeq :+ ident.table
+  }
+
+  private def getTempViewPlan(viewInfo: TemporaryViewRelation): View = viewInfo.plan match {
+    case Some(p) => View(desc = viewInfo.tableMeta, isTempView = true, child = p)
+    case None => fromCatalogTable(viewInfo.tableMeta, isTempView = true)
+  }
+
+  /**
+   * Generates a [[SubqueryAlias]] operator from the stored temporary view.
+   */
+  def getTempViewRelation(viewInfo: TemporaryViewRelation): SubqueryAlias = {
+    SubqueryAlias(toNameParts(viewInfo.tableMeta.identifier).map(format), getTempViewPlan(viewInfo))
   }
 
   // -------------------------------------------------------------
@@ -569,23 +989,12 @@ class SessionCatalog(
    * current database.
    */
   def getTempViewOrPermanentTableMetadata(name: TableIdentifier): CatalogTable = synchronized {
-    val table = formatTableName(name.table)
+    val table = format(name.table)
     if (name.database.isEmpty) {
-      getTempView(table).map { plan =>
-        CatalogTable(
-          identifier = TableIdentifier(table),
-          tableType = CatalogTableType.VIEW,
-          storage = CatalogStorageFormat.empty,
-          schema = plan.output.toStructType)
-      }.getOrElse(getTableMetadata(name))
-    } else if (formatDatabaseName(name.database.get) == globalTempViewManager.database) {
-      globalTempViewManager.get(table).map { plan =>
-        CatalogTable(
-          identifier = TableIdentifier(table, Some(globalTempViewManager.database)),
-          tableType = CatalogTableType.VIEW,
-          storage = CatalogStorageFormat.empty,
-          schema = plan.output.toStructType)
-      }.getOrElse(throw new NoSuchTableException(globalTempViewManager.database, table))
+      tempViews.get(table).map(_.tableMeta).getOrElse(getTableMetadata(name))
+    } else if (format(name.database.get) == globalTempDatabase) {
+      globalTempViewManager.get(table).map(_.tableMeta)
+        .getOrElse(throw new NoSuchTableException(globalTempDatabase, table))
     } else {
       getTableMetadata(name)
     }
@@ -601,34 +1010,31 @@ class SessionCatalog(
    * This assumes the database specified in `newName` matches the one in `oldName`.
    */
   def renameTable(oldName: TableIdentifier, newName: TableIdentifier): Unit = synchronized {
-    val db = formatDatabaseName(oldName.database.getOrElse(currentDb))
-    newName.database.map(formatDatabaseName).foreach { newDb =>
+    val qualifiedIdent = qualifyIdentifier(oldName)
+    val db = qualifiedIdent.database.get
+    newName.database.map(format).foreach { newDb =>
       if (db != newDb) {
-        throw new AnalysisException(
-          s"RENAME TABLE source and destination databases do not match: '$db' != '$newDb'")
+        throw QueryCompilationErrors.renameTableSourceAndDestinationMismatchError(db, newDb)
       }
     }
 
-    val oldTableName = formatTableName(oldName.table)
-    val newTableName = formatTableName(newName.table)
-    if (db == globalTempViewManager.database) {
+    val oldTableName = qualifiedIdent.table
+    val newTableName = format(newName.table)
+    if (db == globalTempDatabase) {
       globalTempViewManager.rename(oldTableName, newTableName)
     } else {
       requireDbExists(db)
       if (oldName.database.isDefined || !tempViews.contains(oldTableName)) {
-        requireTableExists(TableIdentifier(oldTableName, Some(db)))
-        requireTableNotExists(TableIdentifier(newTableName, Some(db)))
         validateName(newTableName)
+        validateNewLocationOfRename(qualifiedIdent, qualifyIdentifier(newName))
         externalCatalog.renameTable(db, oldTableName, newTableName)
       } else {
         if (newName.database.isDefined) {
-          throw new AnalysisException(
-            s"RENAME TEMPORARY VIEW from '$oldName' to '$newName': cannot specify database " +
-              s"name '${newName.database.get}' in the destination table")
+          throw QueryCompilationErrors.cannotRenameTempViewWithDatabaseSpecifiedError(
+            oldName, newName)
         }
         if (tempViews.contains(newTableName)) {
-          throw new AnalysisException(s"RENAME TEMPORARY VIEW from '$oldName' to '$newName': " +
-            "destination table already exists")
+          throw QueryCompilationErrors.cannotRenameTempViewToExistingTableError(newName)
         }
         val table = tempViews(oldTableName)
         tempViews.remove(oldTableName)
@@ -648,23 +1054,18 @@ class SessionCatalog(
       name: TableIdentifier,
       ignoreIfNotExists: Boolean,
       purge: Boolean): Unit = synchronized {
-    val db = formatDatabaseName(name.database.getOrElse(currentDb))
-    val table = formatTableName(name.table)
-    if (db == globalTempViewManager.database) {
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
+    if (db == globalTempDatabase) {
       val viewExists = globalTempViewManager.remove(table)
       if (!viewExists && !ignoreIfNotExists) {
-        throw new NoSuchTableException(globalTempViewManager.database, table)
+        throw new NoSuchTableException(globalTempDatabase, table)
       }
     } else {
       if (name.database.isDefined || !tempViews.contains(table)) {
-        requireDbExists(db)
-        // When ignoreIfNotExists is false, no exception is issued when the table does not exist.
-        // Instead, log it as an error message.
-        if (tableExists(TableIdentifier(table, Option(db)))) {
-          externalCatalog.dropTable(db, table, ignoreIfNotExists = true, purge = purge)
-        } else if (!ignoreIfNotExists) {
-          throw new NoSuchTableException(db = db, table = table)
-        }
+        // Let the external catalog handle all error cases (db not exists, table not exists)
+        externalCatalog.dropTable(db, table, ignoreIfNotExists, purge)
       } else {
         tempViews.remove(table)
       }
@@ -683,52 +1084,231 @@ class SessionCatalog(
    *
    * If the relation is a view, we generate a [[View]] operator from the view description, and
    * wrap the logical plan in a [[SubqueryAlias]] which will track the name of the view.
+   * [[SubqueryAlias]] will also keep track of the name and database(optional) of the table/view
    *
    * @param name The name of the table/view that we look up.
    */
-  def lookupRelation(name: TableIdentifier): LogicalPlan = {
-    synchronized {
-      val db = formatDatabaseName(name.database.getOrElse(currentDb))
-      val table = formatTableName(name.table)
-      if (db == globalTempViewManager.database) {
-        globalTempViewManager.get(table).map { viewDef =>
-          SubqueryAlias(table, viewDef)
-        }.getOrElse(throw new NoSuchTableException(db, table))
-      } else if (name.database.isDefined || !tempViews.contains(table)) {
-        val metadata = externalCatalog.getTable(db, table)
-        if (metadata.tableType == CatalogTableType.VIEW) {
-          val viewText = metadata.viewText.getOrElse(sys.error("Invalid view without text."))
-          // The relation is a view, so we wrap the relation by:
-          // 1. Add a [[View]] operator over the relation to keep track of the view desc;
-          // 2. Wrap the logical plan in a [[SubqueryAlias]] which tracks the name of the view.
-          val child = View(
-            desc = metadata,
-            output = metadata.schema.toAttributes,
-            child = parser.parsePlan(viewText))
-          SubqueryAlias(table, child)
-        } else {
-          SubqueryAlias(table, UnresolvedCatalogRelation(metadata))
-        }
-      } else {
-        SubqueryAlias(table, tempViews(table))
+  def lookupRelation(name: TableIdentifier): LogicalPlan = synchronized {
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
+    if (db == globalTempDatabase) {
+      globalTempViewManager.get(table).map { viewDef =>
+        SubqueryAlias(table, db, getTempViewPlan(viewDef))
+      }.getOrElse(throw new NoSuchTableException(db, table))
+    } else if (name.database.isDefined || !tempViews.contains(table)) {
+      val metadata = externalCatalog.getTable(db, table)
+      getRelation(metadata)
+    } else {
+      SubqueryAlias(table, getTempViewPlan(tempViews(table)))
+    }
+  }
+
+  def getRelation(
+      metadata: CatalogTable,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): LogicalPlan = {
+    val qualifiedIdent = qualifyIdentifier(metadata.identifier)
+    val db = qualifiedIdent.database.get
+    val table = qualifiedIdent.table
+    val multiParts = Seq(CatalogManager.SESSION_CATALOG_NAME, db, table)
+
+    if (CatalogTable.isMetricView(metadata)) {
+      parseMetricViewDefinition(metadata)
+    } else if (metadata.tableType == CatalogTableType.VIEW) {
+      // The relation is a view, so we wrap the relation by:
+      // 1. Add a [[View]] operator over the relation to keep track of the view desc;
+      // 2. Wrap the logical plan in a [[SubqueryAlias]] which tracks the name of the view.
+      SubqueryAlias(multiParts, fromCatalogTable(metadata, isTempView = false))
+    } else {
+      SubqueryAlias(multiParts, UnresolvedCatalogRelation(metadata, options))
+    }
+  }
+
+  private def parseMetricViewDefinition(metadata: CatalogTable): LogicalPlan = {
+    val viewDefinition = metadata.viewText.getOrElse {
+      throw SparkException.internalError("Invalid view without text.")
+    }
+    val viewConfigs = metadata.viewSQLConfigs
+    val origin = CurrentOrigin.get.copy(
+      objectType = Some("METRIC VIEW"),
+      objectName = Some(metadata.qualifiedName)
+    )
+    SQLConf.withExistingConf(
+      View.effectiveSQLConf(
+        configs = viewConfigs,
+        isTempView = false
+      )
+    ) {
+      CurrentOrigin.withOrigin(origin) {
+        MetricViewPlanner.planRead(metadata, viewDefinition, parser, metadata.schema)
       }
     }
   }
 
+  private def buildViewDDL(metadata: CatalogTable, isTempView: Boolean): Option[String] = {
+    if (isTempView) {
+      None
+    } else {
+      val viewName = metadata.identifier.unquotedString
+      val viewText = metadata.viewText.get
+      val userSpecifiedColumns =
+        if (metadata.schema.fieldNames.toImmutableArraySeq == metadata.viewQueryColumnNames) {
+          " "
+        } else {
+          s" (${metadata.schema.fieldNames.mkString(", ")}) "
+        }
+      Some(s"CREATE OR REPLACE VIEW $viewName${userSpecifiedColumns}AS $viewText")
+    }
+  }
+
+  private def isHiveCreatedView(metadata: CatalogTable): Boolean = {
+    // For views created by hive without explicit column names, there will be auto-generated
+    // column names like "_c0", "_c1", "_c2"...
+    metadata.viewQueryColumnNames.isEmpty &&
+      metadata.schema.fieldNames.exists(_.matches("_c[0-9]+"))
+  }
+
+
+  private def castColToType(
+    col: Expression,
+    toField: StructField,
+    schemaMode: ViewSchemaMode): NamedExpression = {
+    val cast = schemaMode match {
+      /*
+      ** For schema binding, we cast the column to the expected type using safe cast only.
+      ** For legacy behavior, we cast the column to the expected type using safe cast only.
+      ** For schema compensation, we cast the column to the expected type using any cast
+      *  in ansi mode.
+      ** For schema (type) evolution, we take the column as is.
+      */
+      case SchemaBinding => UpCast(col, toField.dataType)
+      case SchemaUnsupported => if (conf.viewSchemaCompensation) {
+        Cast(col, toField.dataType, ansiEnabled = true)
+      } else {
+        UpCast(col, toField.dataType)
+      }
+      case SchemaCompensation => Cast(col, toField.dataType, ansiEnabled = true)
+      case SchemaTypeEvolution => col
+      case other => throw SparkException.internalError("Unexpected ViewSchemaMode")
+    }
+    Alias(cast, toField.name)(explicitMetadata = Some(toField.metadata))
+  }
+  private def fromCatalogTable(metadata: CatalogTable, isTempView: Boolean): View = {
+    val viewText = metadata.viewText.getOrElse {
+      throw SparkException.internalError("Invalid view without text.")
+    }
+    val viewConfigs = metadata.viewSQLConfigs
+    val origin = CurrentOrigin.get.copy(
+      objectType = Some("VIEW"),
+      objectName = Some(metadata.qualifiedName)
+    )
+    val parsedPlan = SQLConf.withExistingConf(
+      View.effectiveSQLConf(
+        configs = viewConfigs,
+        isTempView = isTempView,
+        createSparkVersion = metadata.createVersion
+      )
+    ) {
+        CurrentOrigin.withOrigin(origin) {
+          parser.parseQuery(viewText)
+        }
+    }
+    val schemaMode = metadata.viewSchemaMode
+    if (schemaMode == SchemaEvolution) {
+      View(desc = metadata, isTempView = isTempView, child = parsedPlan)
+    } else {
+      val projectList = if (!isHiveCreatedView(metadata)) {
+        val viewColumnNames = if (metadata.viewQueryColumnNames.isEmpty) {
+          // For view created before Spark 2.2.0, the view text is already fully qualified, the plan
+          // output is the same with the view output.
+          metadata.schema.fieldNames.toImmutableArraySeq
+        } else {
+          assert(metadata.viewQueryColumnNames.length == metadata.schema.length,
+            "Corrupted view metadata detected for view " +
+            metadata.identifier.quotedString + ". " +
+            "The number of view query column names " +
+            metadata.viewQueryColumnNames.length + " " +
+            "does not match the number of columns in the view schema " +
+            metadata.schema.length + ". " +
+            "View query column names: [" + metadata.viewQueryColumnNames.mkString(", ") + "], " +
+            "View schema columns: [" + metadata.schema.fieldNames.mkString(", ") + "]. " +
+            "This indicates corrupted view metadata that needs to be repaired.")
+          metadata.viewQueryColumnNames
+        }
+
+        // For view queries like `SELECT * FROM t`, the schema of the referenced table/view may
+        // change after the view has been created. We need to add an extra SELECT to pick the
+        // columns according to the recorded column names (to get the correct view column ordering
+        // and omit the extra columns that we don't require), with UpCast (to make sure the type
+        // change is safe) and Alias (to respect user-specified view column names) according to the
+        // view schema in the catalog.
+        // Note that, the column names may have duplication, e.g. `CREATE VIEW v(x, y) AS
+        // SELECT 1 col, 2 col`. We need to make sure that the matching attributes have the same
+        // number of duplications, and pick the corresponding attribute by ordinal.
+        val viewConf = View.effectiveSQLConf(
+          configs = metadata.viewSQLConfigs,
+          isTempView = isTempView,
+          createSparkVersion = metadata.createVersion
+        )
+        val normalizeColName: String => String = if (viewConf.caseSensitiveAnalysis) {
+          identity
+        } else {
+          _.toLowerCase(Locale.ROOT)
+        }
+        val nameToCounts = viewColumnNames.groupBy(normalizeColName).transform((_, v) => v.length)
+        val nameToCurrentOrdinal = scala.collection.mutable.HashMap.empty[String, Int]
+        val viewDDL = buildViewDDL(metadata, isTempView)
+
+        viewColumnNames.zip(metadata.schema).map { case (name, field) =>
+          val normalizedName = normalizeColName(name)
+          val count = nameToCounts(normalizedName)
+          val ordinal = nameToCurrentOrdinal.getOrElse(normalizedName, 0)
+          nameToCurrentOrdinal(normalizedName) = ordinal + 1
+          val col = GetViewColumnByNameAndOrdinal(
+            metadata.identifier.toString, name, ordinal, count, viewDDL)
+          castColToType(col, field, schemaMode)
+        }
+      } else {
+        // For view created by hive, the parsed view plan may have different output columns with
+        // the schema stored in metadata. For example: `CREATE VIEW v AS SELECT 1 FROM t`
+        // the schema in metadata will be `_c0` while the parsed view plan has column named `1`
+        metadata.schema.zipWithIndex.map { case (field, index) =>
+          val col = GetColumnByOrdinal(index, field.dataType)
+          castColToType(col, field, schemaMode)
+        }
+      }
+      View(desc = metadata, isTempView = isTempView, child = Project(projectList, parsedPlan))
+    }
+  }
+
+  def isGlobalTempViewDB(dbName: String): Boolean = {
+    globalTempDatabase.equalsIgnoreCase(dbName)
+  }
+
+  /**
+   * Return whether the given name parts belong to a temporary or global temporary view.
+   */
+  def isTempView(nameParts: Seq[String]): Boolean = {
+    getRawLocalOrGlobalTempView(nameParts).isDefined
+  }
+
   /**
    * Return whether a table with the specified name is a temporary view.
-   *
-   * Note: The temporary view cache is checked only when database is not
-   * explicitly specified.
    */
-  def isTemporaryTable(name: TableIdentifier): Boolean = synchronized {
-    val table = formatTableName(name.table)
-    if (name.database.isEmpty) {
-      tempViews.contains(table)
-    } else if (formatDatabaseName(name.database.get) == globalTempViewManager.database) {
-      globalTempViewManager.get(table).isDefined
-    } else {
-      false
+  def isTempView(name: TableIdentifier): Boolean = synchronized {
+    isTempView(toNameParts(name))
+  }
+
+  def isView(nameParts: Seq[String]): Boolean = {
+    nameParts.length <= 2 && {
+      import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+      val ident = nameParts.asTableIdentifier
+      try {
+        getTempViewOrPermanentTableMetadata(ident).tableType == CatalogTableType.VIEW
+      } catch {
+        case _: NoSuchTableException => false
+        case _: NoSuchNamespaceException => false
+      }
     }
   }
 
@@ -746,11 +1326,23 @@ class SessionCatalog(
    * Note that, if the specified database is global temporary view database, we will list global
    * temporary views.
    */
-  def listTables(db: String, pattern: String): Seq[TableIdentifier] = {
-    val dbName = formatDatabaseName(db)
-    val dbTables = if (dbName == globalTempViewManager.database) {
+  def listTables(db: String, pattern: String): Seq[TableIdentifier] = listTables(db, pattern, true)
+
+  /**
+   * List all matching tables in the specified database, including local temporary views
+   * if includeLocalTempViews is enabled.
+   *
+   * Note that, if the specified database is global temporary view database, we will list global
+   * temporary views.
+   */
+  def listTables(
+      db: String,
+      pattern: String,
+      includeLocalTempViews: Boolean): Seq[TableIdentifier] = {
+    val dbName = format(db)
+    val dbTables = if (dbName == globalTempDatabase) {
       globalTempViewManager.listViewNames(pattern).map { name =>
-        TableIdentifier(name, Some(globalTempViewManager.database))
+        TableIdentifier(name, Some(globalTempDatabase))
       }
     } else {
       requireDbExists(dbName)
@@ -758,33 +1350,92 @@ class SessionCatalog(
         TableIdentifier(name, Some(dbName))
       }
     }
-    val localTempViews = synchronized {
+
+    if (includeLocalTempViews) {
+      dbTables ++ listLocalTempViews(pattern)
+    } else {
+      dbTables
+    }
+  }
+
+  /**
+   * List all matching views in the specified database, including local temporary views.
+   */
+  def listViews(db: String, pattern: String): Seq[TableIdentifier] = {
+    val dbName = format(db)
+    val dbViews = if (dbName == globalTempDatabase) {
+      globalTempViewManager.listViewNames(pattern).map { name =>
+        TableIdentifier(name, Some(globalTempDatabase))
+      }
+    } else {
+      requireDbExists(dbName)
+      externalCatalog.listViews(dbName, pattern).map { name =>
+        TableIdentifier(name, Some(dbName))
+      }
+    }
+
+    dbViews ++ listLocalTempViews(pattern)
+  }
+
+  /**
+   * List all matching temp views in the specified database, including global/local temporary views.
+   */
+  def listTempViews(db: String, pattern: String): Seq[CatalogTable] = {
+    val globalTempViews = if (format(db) == globalTempDatabase) {
+      globalTempViewManager.listViewNames(pattern).flatMap { viewName =>
+        globalTempViewManager.get(viewName).map(_.tableMeta)
+      }
+    } else {
+      Seq.empty
+    }
+
+    val localTempViews = listLocalTempViews(pattern).flatMap { viewIndent =>
+      tempViews.get(viewIndent.table).map(_.tableMeta)
+    }
+
+    globalTempViews ++ localTempViews
+  }
+
+  /**
+   * List all matching local temporary views.
+   */
+  def listLocalTempViews(pattern: String): Seq[TableIdentifier] = {
+    synchronized {
       StringUtils.filterPattern(tempViews.keys.toSeq, pattern).map { name =>
         TableIdentifier(name)
       }
     }
-    dbTables ++ localTempViews
   }
 
   /**
-   * Refresh the cache entry for a metastore table, if any.
+   * Refresh table entries in structures maintained by the session catalog such as:
+   *   - The map of temporary or global temporary view names to their logical plans
+   *   - The relation cache which maps table identifiers to their logical plans
+   *
+   * For temp views, it refreshes their logical plans, and as a consequence of that it can refresh
+   * the file indexes of the base relations (`HadoopFsRelation` for instance) used in the views.
+   * The method still keeps the views in the internal lists of session catalog.
+   *
+   * For tables/views, it removes their entries from the relation cache.
+   *
+   * The method is supposed to use in the following situations:
+   *   1. The logical plan of a table/view was changed, and cached table/view data is cleared
+   *      explicitly. For example, like in `AlterTableRenameCommand` which re-caches the table
+   *      itself. Otherwise if you need to refresh cached data, consider using of
+   *      `CatalogImpl.refreshTable()`.
+   *   2. A table/view doesn't exist, and need to only remove its entry in the relation cache since
+   *      the cached data is invalidated explicitly like in `DropTableCommand` which uncaches
+   *      table/view data itself.
+   *   3. Meta-data (such as file indexes) of any relation used in a temporary view should be
+   *      updated.
    */
   def refreshTable(name: TableIdentifier): Unit = synchronized {
-    val dbName = formatDatabaseName(name.database.getOrElse(currentDb))
-    val tableName = formatTableName(name.table)
-
-    // Go through temporary views and invalidate them.
-    // If the database is defined, this may be a global temporary view.
-    // If the database is not defined, there is a good chance this is a temp view.
-    if (name.database.isEmpty) {
-      tempViews.get(tableName).foreach(_.refresh())
-    } else if (dbName == globalTempViewManager.database) {
-      globalTempViewManager.get(tableName).foreach(_.refresh())
+    getLocalOrGlobalTempView(name).map(_.refresh()).getOrElse {
+      val qualifiedIdent = qualifyIdentifier(name)
+      val qualifiedTableName = QualifiedTableName(
+        qualifiedIdent.catalog.get, qualifiedIdent.database.get, qualifiedIdent.table)
+      tableRelationCache.invalidate(qualifiedTableName)
     }
-
-    // Also invalidate the table relation cache.
-    val qualifiedTableName = QualifiedTableName(dbName, tableName)
-    tableRelationCache.invalidate(qualifiedTableName)
   }
 
   /**
@@ -815,13 +1466,14 @@ class SessionCatalog(
       tableName: TableIdentifier,
       parts: Seq[CatalogTablePartition],
       ignoreIfExists: Boolean): Unit = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
-    requireExactMatchedPartitionSpec(parts.map(_.spec), getTableMetadata(tableName))
+    requireTableExists(qualifiedIdent)
+    requireExactMatchedPartitionSpec(parts.map(_.spec), getTableMetadata(qualifiedIdent))
     requireNonEmptyValueInPartitionSpec(parts.map(_.spec))
-    externalCatalog.createPartitions(db, table, parts, ignoreIfExists)
+    externalCatalog.createPartitions(
+      db, qualifiedIdent.table, partitionWithQualifiedPath(qualifiedIdent, parts), ignoreIfExists)
   }
 
   /**
@@ -834,13 +1486,14 @@ class SessionCatalog(
       ignoreIfNotExists: Boolean,
       purge: Boolean,
       retainData: Boolean): Unit = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
-    requirePartialMatchedPartitionSpec(specs, getTableMetadata(tableName))
+    requireTableExists(qualifiedIdent)
+    requirePartialMatchedPartitionSpec(specs, getTableMetadata(qualifiedIdent))
     requireNonEmptyValueInPartitionSpec(specs)
-    externalCatalog.dropPartitions(db, table, specs, ignoreIfNotExists, purge, retainData)
+    externalCatalog.dropPartitions(
+      db, qualifiedIdent.table, specs, ignoreIfNotExists, purge, retainData)
   }
 
   /**
@@ -853,16 +1506,16 @@ class SessionCatalog(
       tableName: TableIdentifier,
       specs: Seq[TablePartitionSpec],
       newSpecs: Seq[TablePartitionSpec]): Unit = {
-    val tableMetadata = getTableMetadata(tableName)
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
+    val tableMetadata = getTableMetadata(qualifiedIdent)
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
+    requireTableExists(qualifiedIdent)
     requireExactMatchedPartitionSpec(specs, tableMetadata)
     requireExactMatchedPartitionSpec(newSpecs, tableMetadata)
     requireNonEmptyValueInPartitionSpec(specs)
     requireNonEmptyValueInPartitionSpec(newSpecs)
-    externalCatalog.renamePartitions(db, table, specs, newSpecs)
+    externalCatalog.renamePartitions(db, qualifiedIdent.table, specs, newSpecs)
   }
 
   /**
@@ -875,13 +1528,14 @@ class SessionCatalog(
    * this becomes a no-op.
    */
   def alterPartitions(tableName: TableIdentifier, parts: Seq[CatalogTablePartition]): Unit = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
-    requireExactMatchedPartitionSpec(parts.map(_.spec), getTableMetadata(tableName))
+    requireTableExists(qualifiedIdent)
+    requireExactMatchedPartitionSpec(parts.map(_.spec), getTableMetadata(qualifiedIdent))
     requireNonEmptyValueInPartitionSpec(parts.map(_.spec))
-    externalCatalog.alterPartitions(db, table, parts)
+    externalCatalog.alterPartitions(
+      db, qualifiedIdent.table, partitionWithQualifiedPath(qualifiedIdent, parts))
   }
 
   /**
@@ -889,13 +1543,13 @@ class SessionCatalog(
    * If no database is specified, assume the table is in the current database.
    */
   def getPartition(tableName: TableIdentifier, spec: TablePartitionSpec): CatalogTablePartition = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
-    requireExactMatchedPartitionSpec(Seq(spec), getTableMetadata(tableName))
+    requireTableExists(qualifiedIdent)
+    requireExactMatchedPartitionSpec(Seq(spec), getTableMetadata(qualifiedIdent))
     requireNonEmptyValueInPartitionSpec(Seq(spec))
-    externalCatalog.getPartition(db, table, spec)
+    externalCatalog.getPartition(db, qualifiedIdent.table, spec)
   }
 
   /**
@@ -908,15 +1562,15 @@ class SessionCatalog(
   def listPartitionNames(
       tableName: TableIdentifier,
       partialSpec: Option[TablePartitionSpec] = None): Seq[String] = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
+    requireTableExists(qualifiedIdent)
     partialSpec.foreach { spec =>
-      requirePartialMatchedPartitionSpec(Seq(spec), getTableMetadata(tableName))
+      requirePartialMatchedPartitionSpec(Seq(spec), getTableMetadata(qualifiedIdent))
       requireNonEmptyValueInPartitionSpec(Seq(spec))
     }
-    externalCatalog.listPartitionNames(db, table, partialSpec)
+    externalCatalog.listPartitionNames(db, qualifiedIdent.table, partialSpec)
   }
 
   /**
@@ -929,15 +1583,15 @@ class SessionCatalog(
   def listPartitions(
       tableName: TableIdentifier,
       partialSpec: Option[TablePartitionSpec] = None): Seq[CatalogTablePartition] = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
+    requireTableExists(qualifiedIdent)
     partialSpec.foreach { spec =>
-      requirePartialMatchedPartitionSpec(Seq(spec), getTableMetadata(tableName))
+      requirePartialMatchedPartitionSpec(Seq(spec), getTableMetadata(qualifiedIdent))
       requireNonEmptyValueInPartitionSpec(Seq(spec))
     }
-    externalCatalog.listPartitions(db, table, partialSpec)
+    externalCatalog.listPartitions(db, qualifiedIdent.table, partialSpec)
   }
 
   /**
@@ -947,11 +1601,12 @@ class SessionCatalog(
   def listPartitionsByFilter(
       tableName: TableIdentifier,
       predicates: Seq[Expression]): Seq[CatalogTablePartition] = {
-    val db = formatDatabaseName(tableName.database.getOrElse(getCurrentDatabase))
-    val table = formatTableName(tableName.table)
+    val qualifiedIdent = qualifyIdentifier(tableName)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    requireTableExists(TableIdentifier(table, Option(db)))
-    externalCatalog.listPartitionsByFilter(db, table, predicates, conf.sessionLocalTimeZone)
+    requireTableExists(qualifiedIdent)
+    externalCatalog.listPartitionsByFilter(
+      db, qualifiedIdent.table, predicates, conf.sessionLocalTimeZone)
   }
 
   /**
@@ -959,10 +1614,10 @@ class SessionCatalog(
    */
   private def requireNonEmptyValueInPartitionSpec(specs: Seq[TablePartitionSpec]): Unit = {
     specs.foreach { s =>
-      if (s.values.exists(_.isEmpty)) {
+      if (s.values.exists(v => v != null && v.isEmpty)) {
         val spec = s.map(p => p._1 + "=" + p._2).mkString("[", ", ", "]")
-        throw new AnalysisException(
-          s"Partition spec is invalid. The spec ($spec) contains an empty partition column value")
+        throw QueryCompilationErrors.invalidPartitionSpecError(
+          s"The spec ($spec) contains an empty partition column value")
       }
     }
   }
@@ -974,14 +1629,11 @@ class SessionCatalog(
   private def requireExactMatchedPartitionSpec(
       specs: Seq[TablePartitionSpec],
       table: CatalogTable): Unit = {
-    val defined = table.partitionColumnNames.sorted
-    specs.foreach { s =>
-      if (s.keys.toSeq.sorted != defined) {
-        throw new AnalysisException(
-          s"Partition spec is invalid. The spec (${s.keys.mkString(", ")}) must match " +
-            s"the partition spec (${table.partitionColumnNames.mkString(", ")}) defined in " +
-            s"table '${table.identifier}'")
-      }
+    specs.foreach { spec =>
+      PartitioningUtils.requireExactMatchedPartitionSpec(
+        table.identifier.toString,
+        spec,
+        table.partitionColumnNames)
     }
   }
 
@@ -995,14 +1647,31 @@ class SessionCatalog(
     val defined = table.partitionColumnNames
     specs.foreach { s =>
       if (!s.keys.forall(defined.contains)) {
-        throw new AnalysisException(
-          s"Partition spec is invalid. The spec (${s.keys.mkString(", ")}) must be contained " +
-            s"within the partition spec (${table.partitionColumnNames.mkString(", ")}) defined " +
-            s"in table '${table.identifier}'")
+        throw QueryCompilationErrors.invalidPartitionSpecError(
+          s"The spec (${s.keys.mkString(", ")}) must be contained " +
+          s"within the partition spec (${table.partitionColumnNames.mkString(", ")}) defined " +
+          s"in table '${table.identifier}'")
       }
     }
   }
 
+  /**
+   * Make the partition path qualified.
+   * If the partition path is relative, e.g. 'paris', it will be qualified with
+   * parent path using table location, e.g. 'file:/warehouse/table/paris'
+   */
+  private def partitionWithQualifiedPath(
+      tableIdentifier: TableIdentifier,
+      parts: Seq[CatalogTablePartition]): Seq[CatalogTablePartition] = {
+    lazy val tbl = getTableMetadata(tableIdentifier)
+    parts.map { part =>
+      if (part.storage.locationUri.isDefined && !part.storage.locationUri.get.isAbsolute) {
+        val partPath = new Path(new Path(tbl.location), new Path(part.storage.locationUri.get))
+        val qualifiedPartPath = makeQualifiedPath(CatalogUtils.stringToURI(partPath.toString))
+        part.copy(storage = part.storage.copy(locationUri = Some(qualifiedPartPath)))
+      } else part
+    }
+  }
   // ----------------------------------------------------------------------------
   // Functions
   // ----------------------------------------------------------------------------
@@ -1024,14 +1693,19 @@ class SessionCatalog(
    *                        in the specified database.
    */
   def createFunction(funcDefinition: CatalogFunction, ignoreIfExists: Boolean): Unit = {
-    val db = formatDatabaseName(funcDefinition.identifier.database.getOrElse(getCurrentDatabase))
+    val qualifiedIdent = qualifyIdentifier(funcDefinition.identifier)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    val identifier = FunctionIdentifier(funcDefinition.identifier.funcName, Some(db))
-    val newFuncDefinition = funcDefinition.copy(identifier = identifier)
-    if (!functionExists(identifier)) {
-      externalCatalog.createFunction(db, newFuncDefinition)
+    val newFuncDefinition = funcDefinition.copy(identifier = qualifiedIdent)
+    if (!functionExists(qualifiedIdent)) {
+      try {
+        externalCatalog.createFunction(db, newFuncDefinition)
+      } catch {
+        case e: FunctionAlreadyExistsException if ignoreIfExists =>
+          // Ignore the exception as ignoreIfNotExists is set to true
+      }
     } else if (!ignoreIfExists) {
-      throw new FunctionAlreadyExistsException(db = db, func = identifier.toString)
+      throw new FunctionAlreadyExistsException(Seq(db, qualifiedIdent.funcName))
     }
   }
 
@@ -1040,43 +1714,52 @@ class SessionCatalog(
    * If no database is specified, assume the function is in the current database.
    */
   def dropFunction(name: FunctionIdentifier, ignoreIfNotExists: Boolean): Unit = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    requireDbExists(db)
-    val identifier = name.copy(database = Some(db))
-    if (functionExists(identifier)) {
-      if (functionRegistry.functionExists(identifier)) {
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val funcName = qualifiedIdent.funcName
+    if (!databaseExists(db)) {
+      if (ignoreIfNotExists) {
+        return
+      } else {
+        throw new NoSuchNamespaceException(Seq(CatalogManager.SESSION_CATALOG_NAME, db))
+      }
+    }
+    if (functionExists(qualifiedIdent)) {
+      if (functionRegistry.functionExists(qualifiedIdent)) {
         // If we have loaded this function into the FunctionRegistry,
         // also drop it from there.
         // For a permanent function, because we loaded it to the FunctionRegistry
         // when it's first used, we also need to drop it from the FunctionRegistry.
-        functionRegistry.dropFunction(identifier)
+        functionRegistry.dropFunction(qualifiedIdent)
+      } else if (tableFunctionRegistry.functionExists(qualifiedIdent)) {
+        tableFunctionRegistry.dropFunction(qualifiedIdent)
       }
-      externalCatalog.dropFunction(db, name.funcName)
+      externalCatalog.dropFunction(db, funcName)
     } else if (!ignoreIfNotExists) {
-      throw new NoSuchFunctionException(db = db, func = identifier.toString)
+      throw new NoSuchPermanentFunctionException(db = db, func = funcName)
     }
   }
 
   /**
-   * overwirte a metastore function in the database specified in `funcDefinition`..
+   * overwrite a metastore function in the database specified in `funcDefinition`..
    * If no database is specified, assume the function is in the current database.
    */
   def alterFunction(funcDefinition: CatalogFunction): Unit = {
-    val db = formatDatabaseName(funcDefinition.identifier.database.getOrElse(getCurrentDatabase))
+    val qualifiedIdent = qualifyIdentifier(funcDefinition.identifier)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    val identifier = FunctionIdentifier(funcDefinition.identifier.funcName, Some(db))
-    val newFuncDefinition = funcDefinition.copy(identifier = identifier)
-    if (functionExists(identifier)) {
-      if (functionRegistry.functionExists(identifier)) {
+    val newFuncDefinition = funcDefinition.copy(identifier = qualifiedIdent)
+    if (functionExists(qualifiedIdent)) {
+      if (functionRegistry.functionExists(qualifiedIdent)) {
         // If we have loaded this function into the FunctionRegistry,
         // also drop it from there.
         // For a permanent function, because we loaded it to the FunctionRegistry
         // when it's first used, we also need to drop it from the FunctionRegistry.
-        functionRegistry.dropFunction(identifier)
+        functionRegistry.dropFunction(qualifiedIdent)
       }
       externalCatalog.alterFunction(db, newFuncDefinition)
     } else {
-      throw new NoSuchFunctionException(db = db, func = identifier.toString)
+      throw new NoSuchPermanentFunctionException(db = db, func = qualifiedIdent.funcName)
     }
   }
 
@@ -1087,19 +1770,29 @@ class SessionCatalog(
    * If no database is specified, this will return the function in the current database.
    */
   def getFunctionMetadata(name: FunctionIdentifier): CatalogFunction = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
     requireDbExists(db)
-    externalCatalog.getFunction(db, name.funcName)
+    externalCatalog.getFunction(db, qualifiedIdent.funcName).copy(identifier = qualifiedIdent)
   }
 
   /**
    * Check if the function with the specified name exists
    */
   def functionExists(name: FunctionIdentifier): Boolean = {
-    val db = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    requireDbExists(db)
-    functionRegistry.functionExists(name) ||
-      externalCatalog.functionExists(db, name.funcName)
+    isRegisteredFunction(name) || {
+      val qualifiedIdent = qualifyIdentifier(name)
+      val db = qualifiedIdent.database.get
+      requireDbExists(db)
+      externalCatalog.functionExists(db, qualifiedIdent.funcName)
+    }
+  }
+
+  /**
+   * Create a user defined function.
+   */
+  def createUserDefinedFunction(function: UserDefinedFunction, ignoreIfExists: Boolean): Unit = {
+    createFunction(function.toCatalogFunction, ignoreIfExists)
   }
 
   // ----------------------------------------------------------------
@@ -1109,30 +1802,292 @@ class SessionCatalog(
   /**
    * Constructs a [[FunctionBuilder]] based on the provided class that represents a function.
    */
-  private def makeFunctionBuilder(name: String, functionClassName: String): FunctionBuilder = {
-    val clazz = Utils.classForName(functionClassName)
-    (input: Seq[Expression]) => makeFunctionExpression(name, clazz, input)
+  private def makeSQLFunctionBuilder(function: SQLFunction): FunctionBuilder = {
+    if (function.isTableFunc) {
+      throw UserDefinedFunctionErrors.notAScalarFunction(function.name.nameParts)
+    }
+    (input: Seq[Expression]) => {
+      // Check if any input contains a lambda variable
+      val hasLambdaVar = input.exists { expr =>
+        expr.find {
+          case _: NamedLambdaVariable => true
+          case _: UnresolvedNamedLambdaVariable => true
+          case _ => false
+        }.isDefined
+      }
+      if (hasLambdaVar) {
+        throw new AnalysisException(
+          errorClass = "UNSUPPORTED_FEATURE.LAMBDA_FUNCTION_WITH_SQL_UDF",
+          messageParameters = Map(
+            "funcName" -> function.name.unquotedString))
+      }
+      val args = rearrangeArguments(function.inputParam, input, function.name.toString)
+      val returnType = function.getScalarFuncReturnType
+      SQLFunctionExpression(
+        function.name.unquotedString, function, args, Some(returnType))
+    }
   }
 
   /**
-   * Constructs a [[Expression]] based on the provided class that represents a function.
+   * Constructs a scalar SQL function logical plan. The logical plan will be used to
+   * construct actual expression from the function inputs and body.
    *
-   * This performs reflection to decide what type of [[Expression]] to return in the builder.
+   * The body of a scalar SQL function can either be an expression or a query returns
+   * one single column.
+   *
+   * Example scalar SQL function with an expression:
+   *
+   *   CREATE FUNCTION area(width DOUBLE, height DOUBLE) RETURNS DOUBLE
+   *   RETURN width * height;
+   *
+   * Query:
+   *
+   *   SELECT area(a, b) FROM t;
+   *
+   * SQL function plan:
+   *
+   *   Project [CAST(width * height AS DOUBLE) AS area]
+   *   +- Project [CAST(a AS DOUBLE) AS width, CAST(b AS DOUBLE) AS height]
+   *      +- LocalRelation [a, b]
+   *
+   * Example scalar SQL function with a subquery:
+   *
+   *   CREATE FUNCTION foo(x INT) RETURNS INT
+   *   RETURN SELECT SUM(b) FROM t WHERE x = a;
+   *
+   *   SELECT foo(a) FROM t;
+   *
+   * SQL function plan:
+   *
+   *   Project [scalar-subquery AS foo]
+   *   :  +- Aggregate [] [sum(b)]
+   *   :     +- Filter [outer(x) = a]
+   *   :        +- Relation [a, b]
+   *   +- Project [CAST(a AS INT) AS x]
+   *      +- LocalRelation [a, b]
    */
-  protected def makeFunctionExpression(
+  def makeSQLFunctionPlan(
       name: String,
-      clazz: Class[_],
-      input: Seq[Expression]): Expression = {
-    val clsForUDAF =
-      Utils.classForName("org.apache.spark.sql.expressions.UserDefinedAggregateFunction")
-    if (clsForUDAF.isAssignableFrom(clazz)) {
-      val cls = Utils.classForName("org.apache.spark.sql.execution.aggregate.ScalaUDAF")
-      cls.getConstructor(classOf[Seq[Expression]], clsForUDAF, classOf[Int], classOf[Int])
-        .newInstance(input, clazz.newInstance().asInstanceOf[Object], Int.box(1), Int.box(1))
-        .asInstanceOf[Expression]
+      function: SQLFunction,
+      input: Seq[Expression]): LogicalPlan = {
+    def metaForFuncInputAlias = {
+      new MetadataBuilder()
+        .putString("__funcInputAlias", "true")
+        .build()
+    }
+    assert(!function.isTableFunc,
+      "Function '" + function.name + "' is a table function. " +
+      "Use makeSQLTableFunctionPlan() instead of makeSQLFunctionPlan().")
+    val funcName = function.name.funcName
+
+    // Use captured SQL configs when parsing a SQL function.
+    val conf = new SQLConf()
+    function.getSQLConfigs.foreach { case (k, v) => conf.settings.put(k, v) }
+    Analyzer.trySetAnsiValue(conf)
+    SQLConf.withExistingConf(conf) {
+      val inputParam = function.inputParam
+      val returnType = function.getScalarFuncReturnType
+      val (expression, query) = function.getExpressionAndQuery(parser, isTableFunc = false)
+      assert(expression.isDefined || query.isDefined,
+        "SQL function '" + function.name + "' could not be parsed. " +
+        "Neither expression nor query could be extracted from function body. " +
+        "exprText=" + function.exprText + ", queryText=" + function.queryText + ".")
+
+      // Check function arguments
+      val paramSize = inputParam.map(_.size).getOrElse(0)
+      if (input.size > paramSize) {
+        throw QueryCompilationErrors.wrongNumArgsError(
+          name, paramSize.toString, input.size)
+      }
+
+      // Check if any input contains a lambda variable
+      val hasLambdaVar = input.exists { expr =>
+        expr.find {
+          case _: NamedLambdaVariable => true
+          case _: UnresolvedNamedLambdaVariable => true
+          case _ => false
+        }.isDefined
+      }
+      if (hasLambdaVar) {
+        throw new AnalysisException(
+          errorClass = "UNSUPPORTED_FEATURE.LAMBDA_FUNCTION_WITH_SQL_UDF",
+          messageParameters = Map(
+            "funcName" -> function.name.unquotedString))
+      }
+
+      val inputs = inputParam.map { param =>
+        // Attributes referencing the input parameters inside the function can use the
+        // function name as a qualifier. E.G.:
+        // `create function foo(a int) returns int return foo.a`
+        val qualifier = Seq(funcName)
+        val paddedInput = input ++
+          param.takeRight(paramSize - input.size).map { p =>
+            val defaultExpr = p.getDefault()
+            if (defaultExpr.isDefined) {
+              Cast(parseDefault(defaultExpr.get, parser), p.dataType)
+            } else {
+              throw QueryCompilationErrors.wrongNumArgsError(
+                name, paramSize.toString, input.size)
+            }
+          }
+
+        paddedInput.zip(param.fields).map {
+          case (expr, param) =>
+            // Add outer references to all resolved attributes and outer references in the function
+            // input. Outer references also need to be wrapped because the function input may
+            // already contain outer references.
+            val outer = expr.transform {
+              case a: Attribute if a.resolved => OuterReference(a)
+              case o: OuterReference => OuterReference(o)
+            }
+            Alias(Cast(outer, param.dataType), param.name)(
+              qualifier = qualifier,
+              // mark the alias as function input
+              explicitMetadata = Some(metaForFuncInputAlias))
+        }
+      }.getOrElse(Nil)
+
+      val body = if (query.isDefined) ScalarSubquery(query.get) else expression.get
+      Project(Alias(Cast(body, returnType), funcName)() :: Nil, Project(inputs, OneRowRelation()))
+    }
+  }
+
+  /**
+   * Constructs a [[TableFunctionBuilder]] based on the provided class that represents a function.
+   */
+  private def makeSQLTableFunctionBuilder(function: SQLFunction): TableFunctionBuilder = {
+    if (!function.isTableFunc) {
+      throw UserDefinedFunctionErrors.notATableFunction(function.name.nameParts)
+    }
+    (input: Seq[Expression]) => {
+      val args = rearrangeArguments(function.inputParam, input, function.name.toString)
+      val returnParam = function.getTableFuncReturnCols
+      val output = returnParam.fields.map { param =>
+        AttributeReference(param.name, param.dataType, param.nullable)()
+      }
+      SQLTableFunction(function.name.unquotedString, function, args, output.toSeq)
+    }
+  }
+
+  /**
+   * Constructs a SQL table function plan.
+   * This function should be invoked with the captured SQL configs from the function.
+   *
+   * Example SQL table function:
+   *
+   *   CREATE FUNCTION foo(x INT) RETURNS TABLE(a INT) RETURN SELECT x + 1 AS x1
+   *
+   * Query:
+   *
+   *   SELECT * FROM foo(1);
+   *
+   * Plan:
+   *
+   *   Project [CAST(x1 AS INT) AS a]
+   *   +- LateralJoin lateral-subquery [x]
+   *      :  +- Project [(outer(x) + 1) AS x1]
+   *      :     +- OneRowRelation
+   *      +- Project [CAST(1 AS INT) AS x]
+   *         +- OneRowRelation
+   */
+  def makeSQLTableFunctionPlan(
+      name: String,
+      function: SQLFunction,
+      input: Seq[Expression],
+      outputAttrs: Seq[Attribute]): LogicalPlan = {
+    assert(function.isTableFunc,
+      "Function '" + function.name + "' is a scalar function. " +
+      "Use makeSQLFunctionPlan() instead of makeSQLTableFunctionPlan().")
+    val funcName = function.name.funcName
+    val inputParam = function.inputParam
+    val returnParam = function.getTableFuncReturnCols
+    val (_, query) = function.getExpressionAndQuery(parser, isTableFunc = true)
+    assert(query.isDefined,
+      "SQL table function '" + function.name + "' could not be parsed. " +
+      "Query could not be extracted from function body. " +
+      "queryText=" + function.queryText + ".")
+
+    // Check function arguments
+    val paramSize = inputParam.map(_.size).getOrElse(0)
+    if (input.size > paramSize) {
+      throw QueryCompilationErrors.wrongNumArgsError(
+        name, paramSize.toString, input.size)
+    }
+
+    val body = if (inputParam.isDefined) {
+      val param = inputParam.get
+      // Attributes referencing the input parameters inside the function can use the
+      // function name as a qualifier.
+      val qualifier = Seq(funcName)
+      val paddedInput = input ++
+        param.takeRight(paramSize - input.size).map { p =>
+          val defaultExpr = p.getDefault()
+          if (defaultExpr.isDefined) {
+            parseDefault(defaultExpr.get, parser)
+          } else {
+            throw QueryCompilationErrors.wrongNumArgsError(
+              name, paramSize.toString, input.size)
+          }
+        }
+
+      val inputCast = paddedInput.zip(param.fields).map {
+        case (expr, param) =>
+          // Add outer references to all attributes in the function input.
+          val outer = expr.transform {
+            case a: Attribute => OuterReference(a)
+          }
+          Alias(Cast(outer, param.dataType), param.name)(qualifier = qualifier)
+      }
+      val inputPlan = Project(inputCast, OneRowRelation())
+      LateralJoin(inputPlan, LateralSubquery(query.get), Inner, None)
     } else {
-      throw new AnalysisException(s"No handler for UDAF '${clazz.getCanonicalName}'. " +
-        s"Use sparkSession.udf.register(...) instead.")
+      query.get
+    }
+
+    assert(returnParam.length == outputAttrs.length,
+      "SQL table function '" + function.name + "' has mismatched return columns. " +
+      "Expected " + outputAttrs.length + " output attributes but found " +
+      returnParam.length + " return parameters. " +
+      "Return parameters: [" + returnParam.fieldNames.mkString(", ") + "], " +
+      "Output attributes: [" + outputAttrs.map(_.name).mkString(", ") + "].")
+    val output = returnParam.fields.zipWithIndex.map { case (param, i) =>
+      // Since we cannot get the output of a unresolved logical plan, we need
+      // to reference the output column of the lateral join by its position.
+      val child = Cast(GetColumnByOrdinal(paramSize + i, param.dataType), param.dataType)
+      Alias(child, param.name)(exprId = outputAttrs(i).exprId)
+    }
+    SQLFunctionNode(function, SubqueryAlias(funcName, Project(output.toSeq, body)))
+  }
+
+  /**
+   * Constructs a [[FunctionBuilder]] based on the provided function metadata.
+   */
+  private def makeFunctionBuilder(func: CatalogFunction): FunctionBuilder = {
+    val className = func.className
+    if (!Utils.classIsLoadable(className)) {
+      throw QueryCompilationErrors.cannotLoadClassWhenRegisteringFunctionError(
+        className, func.identifier)
+    }
+    val clazz = Utils.classForName(className)
+    val name = func.identifier.unquotedString
+    (input: Seq[Expression]) => functionExpressionBuilder.makeExpression(name, clazz, input)
+  }
+
+  private def makeUserDefinedScalarFuncBuilder(func: UserDefinedFunction): FunctionBuilder = {
+    func match {
+      case f: SQLFunction => makeSQLFunctionBuilder(f)
+      case _ =>
+        val clsName = func.getClass.getSimpleName
+        throw UserDefinedFunctionErrors.unsupportedUserDefinedFunction(clsName)
+    }
+  }
+
+  private def makeUserDefinedTableFuncBuilder(func: UserDefinedFunction): TableFunctionBuilder = {
+    func match {
+      case f: SQLFunction => makeSQLTableFunctionBuilder(f)
+      case _ =>
+        val clsName = func.getClass.getSimpleName
+        throw UserDefinedFunctionErrors.unsupportedUserDefinedFunction(clsName)
     }
   }
 
@@ -1145,34 +2100,210 @@ class SessionCatalog(
   }
 
   /**
-   * Registers a temporary or permanent function into a session-specific [[FunctionRegistry]]
+   * Registers a temporary or permanent scalar function into a session-specific [[FunctionRegistry]]
    */
   def registerFunction(
       funcDefinition: CatalogFunction,
       overrideIfExists: Boolean,
       functionBuilder: Option[FunctionBuilder] = None): Unit = {
+    val builder = functionBuilder.getOrElse(makeFunctionBuilder(funcDefinition))
+    registerFunction(funcDefinition, overrideIfExists, functionRegistry, builder)
+  }
+
+  private def registerFunction[T](
+      funcDefinition: CatalogFunction,
+      overrideIfExists: Boolean,
+      registry: FunctionRegistryBase[T],
+      functionBuilder: FunctionRegistryBase[T]#FunctionBuilder): Unit = {
     val func = funcDefinition.identifier
-    if (functionRegistry.functionExists(func) && !overrideIfExists) {
-      throw new AnalysisException(s"Function $func already exists")
+
+    // Determine the key to use for registration:
+    // - Temporary functions (unqualified): use composite key with TEMP_FUNCTION_DB database
+    // - Persistent functions (qualified): keep qualification to avoid conflicts
+    val identToRegister = if (func.database.isEmpty) {
+      // Temporary function: use TEMP_FUNCTION_DB.funcName
+      tempFunctionIdentifier(func.funcName)
+    } else {
+      // Persistent function: keep original qualified identifier
+      func
     }
-    val info = new ExpressionInfo(funcDefinition.className, func.database.orNull, func.funcName)
-    val builder =
-      functionBuilder.getOrElse {
-        val className = funcDefinition.className
-        if (!Utils.classIsLoadable(className)) {
-          throw new AnalysisException(s"Can not load class '$className' when registering " +
-            s"the function '$func', please make sure it is on the classpath")
-        }
-        makeFunctionBuilder(func.unquotedString, className)
+
+    // Security check: When legacy mode is enabled, block SQL-created temporary functions
+    // from shadowing builtin functions (to preserve master behavior)
+    // Scala UDFs are still allowed to shadow in legacy mode
+    // We throw ROUTINE_ALREADY_EXISTS to indicate the builtin function already exists
+    val sessionFirst = conf.sessionFunctionResolutionOrder == "first"
+    if (func.database.isEmpty && sessionFirst && !overrideIfExists) {
+      val funcName = func.funcName
+      // Check if function exists in builtin namespace (extensions are stored as builtins)
+      val builtinIdent = FunctionIdentifier(format(funcName))
+      if (functionRegistry.functionExists(builtinIdent) ||
+          tableFunctionRegistry.functionExists(builtinIdent)) {
+        throw QueryCompilationErrors.functionAlreadyExistsError(func)
       }
-    functionRegistry.registerFunction(func, info, builder)
+    }
+
+    if (registry.functionExists(identToRegister) && !overrideIfExists) {
+      throw QueryCompilationErrors.functionAlreadyExistsError(func)
+    }
+    val info = makeExprInfoForHiveFunction(funcDefinition)
+    registry.registerFunction(identToRegister, info, functionBuilder)
+  }
+
+  private def makeExprInfoForHiveFunction(func: CatalogFunction): ExpressionInfo = {
+    new ExpressionInfo(
+      func.className,
+      func.identifier.database.orNull,
+      func.identifier.funcName,
+      null,
+      "",
+      "",
+      "",
+      "",
+      "",
+      "",
+      "hive")
+  }
+
+  /**
+   * Registers a temporary or persistent SQL scalar function into a session-specific
+   * [[FunctionRegistry]].
+   */
+  def registerSQLScalarFunction(
+      function: SQLFunction,
+      overrideIfExists: Boolean): Unit = {
+    registerUserDefinedFunction[Expression](
+      function,
+      overrideIfExists,
+      functionRegistry,
+      makeSQLFunctionBuilder(function))
+  }
+
+  /**
+   * Registers a temporary or persistent SQL table function into a session-specific
+   * [[TableFunctionRegistry]].
+   */
+  def registerSQLTableFunction(
+      function: SQLFunction,
+      overrideIfExists: Boolean): Unit = {
+    registerUserDefinedFunction[LogicalPlan](
+      function,
+      overrideIfExists,
+      tableFunctionRegistry,
+      makeSQLTableFunctionBuilder(function))
+  }
+
+  /**
+   * Rearranges the arguments of a UDF into positional order.
+   */
+  private def rearrangeArguments(
+      inputParams: Option[StructType],
+      expressions: Seq[Expression],
+      functionName: String) : Seq[Expression] = {
+    val firstNamedArgumentExpressionIdx =
+      expressions.indexWhere(_.isInstanceOf[NamedArgumentExpression])
+    if (firstNamedArgumentExpressionIdx == -1) {
+      return expressions
+    }
+
+    val paramNames: Seq[InputParameter] =
+      if (inputParams.isDefined) {
+        inputParams.get.map {
+          p => p.getDefault() match {
+            case Some(defaultExpr) =>
+              // This cast is needed to ensure the default value is of the target data type.
+              InputParameter(p.name, Some(Cast(parseDefault(defaultExpr, parser), p.dataType)))
+            case None =>
+              InputParameter(p.name)
+          }
+        }.toSeq
+      } else {
+        Seq()
+      }
+
+    NamedParametersSupport.defaultRearrange(
+      FunctionSignature(paramNames), expressions, functionName, SQLConf.get.resolver)
+  }
+
+  /**
+   * Registers a temporary or permanent SQL function into a session-specific function registry.
+   * For temporary functions, validates that the function name doesn't exist as a different type
+   * (scalar vs. table) to prevent ambiguous DROP operations.
+   * For persistent functions, the metastore already enforces this constraint.
+   */
+  private def registerUserDefinedFunction[T](
+      function: UserDefinedFunction,
+      overrideIfExists: Boolean,
+      registry: FunctionRegistryBase[T],
+      functionBuilder: Seq[Expression] => T): Unit = {
+
+    val isTemporary = function.name.database.isEmpty
+
+    if (isTemporary) {
+      // Use FunctionIdentifier with TEMP_FUNCTION_DB for temporary functions
+      val tempIdentifier = tempFunctionIdentifier(function.name.funcName)
+
+      // Security check: When legacy mode is enabled, block SQL-created temporary functions
+      // from shadowing builtin functions (including extensions) as a safeguard
+      // We throw ROUTINE_ALREADY_EXISTS to indicate the builtin function already exists
+      if ((conf.sessionFunctionResolutionOrder == "first") && !overrideIfExists) {
+        val funcName = function.name.funcName
+        // Check if function exists in builtin namespace (extensions are stored as builtins)
+        val builtinIdent = FunctionIdentifier(format(funcName))
+        if (functionRegistry.functionExists(builtinIdent) ||
+            tableFunctionRegistry.functionExists(builtinIdent)) {
+          throw QueryCompilationErrors.functionAlreadyExistsError(function.name)
+        }
+      }
+
+      // Check if this temp function already exists in the target registry
+      if (registry.functionExists(tempIdentifier) && !overrideIfExists) {
+        throw QueryCompilationErrors.functionAlreadyExistsError(function.name)
+      }
+
+      // Check if function exists in the OTHER registry as a different type.
+      // This prevents having both scalar and table temporary functions with the same name,
+      // which would make DROP TEMPORARY FUNCTION ambiguous (it would drop both).
+      val otherRegistry: FunctionRegistryBase[_] =
+        if (registry eq functionRegistry) tableFunctionRegistry else functionRegistry
+      if (otherRegistry.functionExists(tempIdentifier) && !overrideIfExists) {
+        throw QueryCompilationErrors.functionAlreadyExistsError(function.name)
+      }
+
+      // With OR REPLACE, drop from the other registry first if it exists there
+      if (overrideIfExists) {
+        otherRegistry.dropFunction(tempIdentifier)
+      }
+
+      val info = function.toExpressionInfo
+      registry.registerFunction(tempIdentifier, info, functionBuilder)
+    } else {
+      registerFunction(
+        function.toCatalogFunction,
+        overrideIfExists,
+        registry,
+        functionBuilder)
+    }
+  }
+
+  /**
+   * Unregister a temporary or permanent function from a session-specific [[FunctionRegistry]]
+   * or [[TableFunctionRegistry]]. Return true if function exists.
+   */
+  def unregisterFunction(name: FunctionIdentifier): Boolean = {
+    // If it's an unqualified name, it's a temp function stored with TEMP_FUNCTION_DB database
+    val tempIdent = if (name.database.isEmpty) tempFunctionIdentifier(name.funcName) else name
+    functionRegistry.dropFunction(tempIdent) || tableFunctionRegistry.dropFunction(tempIdent)
   }
 
   /**
    * Drop a temporary function.
    */
   def dropTempFunction(name: String, ignoreIfNotExists: Boolean): Unit = {
-    if (!functionRegistry.dropFunction(FunctionIdentifier(name)) && !ignoreIfNotExists) {
+    val tempIdent = tempFunctionIdentifier(name)
+    if (!functionRegistry.dropFunction(tempIdent) &&
+        !tableFunctionRegistry.dropFunction(tempIdent) &&
+        !ignoreIfNotExists) {
       throw new NoSuchTempFunctionException(name)
     }
   }
@@ -1181,99 +2312,455 @@ class SessionCatalog(
    * Returns whether it is a temporary function. If not existed, returns false.
    */
   def isTemporaryFunction(name: FunctionIdentifier): Boolean = {
-    // copied from HiveSessionCatalog
-    val hiveFunctions = Seq("histogram_numeric")
-
-    // A temporary function is a function that has been registered in functionRegistry
-    // without a database name, and is neither a built-in function nor a Hive function
-    name.database.isEmpty &&
-      functionRegistry.functionExists(name) &&
-      !FunctionRegistry.builtin.functionExists(name) &&
-      !hiveFunctions.contains(name.funcName.toLowerCase(Locale.ROOT))
+    // A temporary function is stored with database = TEMP_FUNCTION_DB
+    if (name.database.isEmpty) {
+      val tempIdent = tempFunctionIdentifier(name.funcName)
+      functionRegistry.functionExists(tempIdent) ||
+        tableFunctionRegistry.functionExists(tempIdent)
+    } else {
+      isTempFunctionIdentifier(name) &&
+        (functionRegistry.functionExists(name) || tableFunctionRegistry.functionExists(name))
+    }
   }
 
-  protected def failFunctionLookup(name: FunctionIdentifier): Nothing = {
+  /**
+   * Return whether this function has been registered in the function registry of the current
+   * session. If not existed, return false.
+   */
+  def isRegisteredFunction(name: FunctionIdentifier): Boolean = {
+    // Check if it exists as temp (with TEMP_FUNCTION_DB db) or builtin (without db) or persistent
+    if (name.database.isEmpty) {
+      val tempIdent = tempFunctionIdentifier(name.funcName)
+      val builtinIdent = FunctionIdentifier(format(name.funcName))
+
+      // Check if temp function exists
+      val hasTemp = functionRegistry.functionExists(tempIdent) ||
+                     tableFunctionRegistry.functionExists(tempIdent)
+
+      // Check if builtin exists - but ONLY if it's actually a builtin, not a cached persistent
+      val hasBuiltin = (FunctionRegistry.functionSet.contains(builtinIdent) ||
+                        TableFunctionRegistry.functionSet.contains(builtinIdent)) &&
+                       (functionRegistry.functionExists(builtinIdent) ||
+                        tableFunctionRegistry.functionExists(builtinIdent))
+
+      hasTemp || hasBuiltin
+    } else {
+      functionRegistry.functionExists(name) || tableFunctionRegistry.functionExists(name)
+    }
+  }
+
+  /**
+   * Returns whether it is a persistent function. If not existed, returns false.
+   */
+  def isPersistentFunction(name: FunctionIdentifier): Boolean = {
+    val qualifiedIdent = qualifyIdentifier(name)
+    val db = qualifiedIdent.database.get
+    val funcName = qualifiedIdent.funcName
+    databaseExists(db) && externalCatalog.functionExists(db, funcName)
+  }
+
+  /**
+   * Returns whether it is a built-in function.
+   */
+  def isBuiltinFunction(name: FunctionIdentifier): Boolean = {
+    FunctionRegistry.builtin.functionExists(name) ||
+      TableFunctionRegistry.builtin.functionExists(name)
+  }
+
+  protected[sql] def failFunctionLookup(name: FunctionIdentifier): Nothing = {
     throw new NoSuchFunctionException(
       db = name.database.getOrElse(getCurrentDatabase), func = name.funcName)
+  }
+
+  /**
+   * Handles view resolution context for temporary functions (both scalar and table-valued).
+   * When resolving a view, only returns the result if the function is explicitly referred
+   * by that view. Otherwise, tracks the function reference for future view creation.
+   *
+   * This generic helper works for both scalar functions (FunctionRegistry) and table-valued
+   * functions (TableFunctionRegistry) due to the type parameter T.
+   *
+   * @param name The function name (unqualified)
+   * @param result The result to wrap with view context handling
+   * @tparam T The result type (ExpressionInfo, Expression, or LogicalPlan)
+   * @return The result if visible in current context, None otherwise
+   */
+  private def handleViewContext[T](name: String, result: Option[T]): Option[T] =
+    result.filter { _ =>
+      val isResolvingView = AnalysisContext.get.catalogAndNamespace.nonEmpty
+      val referredTempFunctionNames = AnalysisContext.get.referredTempFunctionNames
+
+      if (isResolvingView) {
+        // When resolving a view, only return a temp function if it's referred by this view.
+        referredTempFunctionNames.contains(name)
+      } else {
+        // We are not resolving a view and the function is a temp one, add it to
+        // AnalysisContext so if a view is being created, it can be checked.
+        AnalysisContext.get.referredTempFunctionNames.add(name)
+        true
+      }
+    }
+
+  /**
+   * Looks up functions using PATH-based resolution.
+   * Searches through the configured resolution path with view context handling.
+   *
+   * @param name The function name (unqualified).
+   * @param registry The registry to search (FunctionRegistry or TableFunctionRegistry).
+   * @param checkBuiltinOperators Whether to check built-in operators first (scalar functions only).
+   * @tparam T The registry's type parameter (Expression for FunctionRegistry,
+   *           LogicalPlan for TableFunctionRegistry).
+   * @return ExpressionInfo if function found, None otherwise.
+   */
+  private def lookupFunctionWithShadowing[T](
+      name: String,
+      registry: FunctionRegistryBase[T],
+      checkBuiltinOperators: Boolean): Option[ExpressionInfo] = {
+
+    // Check built-in operators first (only for scalar functions).
+    val operatorResult = if (checkBuiltinOperators) {
+      FunctionRegistry.builtinOperators.get(name.toLowerCase(Locale.ROOT))
+    } else {
+      None
+    }
+
+    operatorResult.orElse {
+      // Use PATH-based resolution: iterate through namespaces until a match is found.
+      val path = resolutionPath()
+
+      // Use iterator for short-circuit evaluation (stops at first match).
+      path.iterator.flatMap { namespace =>
+        lookupInNamespace(namespace, name, registry)
+      }.nextOption()
+    }
+  }
+
+  /**
+   * Builds the FunctionIdentifier for a given session function kind and name.
+   * Used by the kind-based lookup/resolve API.
+   */
+  private def functionIdentifier(
+      kind: SessionCatalog.SessionFunctionKind,
+      name: String): FunctionIdentifier =
+    kind match {
+      case SessionCatalog.Builtin =>
+        FunctionIdentifier(format(name))
+      case SessionCatalog.Temp =>
+        tempFunctionIdentifier(name)
+    }
+
+  /**
+   * Kind-based lookup: one entry point for all
+   * (builtin/temp) x (scalar/table).
+   * Callers that have already determined the kind (e.g. FunctionResolution) use this
+   * instead of separate lookup* methods.
+   */
+  def lookupFunctionInfo(
+      kind: SessionCatalog.SessionFunctionKind,
+      name: String,
+      tableFunction: Boolean): Option[ExpressionInfo] = {
+    val identifier = functionIdentifier(kind, name)
+    val registry = if (tableFunction) tableFunctionRegistry else functionRegistry
+    kind match {
+      case SessionCatalog.Temp =>
+        synchronized {
+          handleViewContext(name, registry.lookupFunction(identifier))
+        }
+      case _ =>
+        registry.lookupFunction(identifier)
+    }
+  }
+
+  /**
+   * Kind-based resolve for scalar functions.
+   */
+  def resolveScalarFunction(
+      kind: SessionCatalog.SessionFunctionKind,
+      name: String,
+      arguments: Seq[Expression]): Option[Expression] = {
+    val identifier = functionIdentifier(kind, name)
+    kind match {
+      case SessionCatalog.Builtin =>
+        if (functionRegistry.functionExists(identifier)) {
+          Option(functionRegistry.lookupFunction(identifier, arguments))
+        } else {
+          None
+        }
+      case SessionCatalog.Temp =>
+        synchronized {
+          if (functionRegistry.functionExists(identifier)) {
+            handleViewContext(name, Option(functionRegistry.lookupFunction(identifier, arguments)))
+          } else {
+            None
+          }
+        }
+    }
+  }
+
+  /**
+   * Kind-based resolve for table functions.
+   */
+  def resolveTableFunction(
+      kind: SessionCatalog.SessionFunctionKind,
+      name: String,
+      arguments: Seq[Expression]): Option[LogicalPlan] = {
+    val identifier = functionIdentifier(kind, name)
+    kind match {
+      case SessionCatalog.Builtin =>
+        if (tableFunctionRegistry.functionExists(identifier)) {
+          Option(tableFunctionRegistry.lookupFunction(identifier, arguments))
+        } else {
+          None
+        }
+      case SessionCatalog.Temp =>
+        synchronized {
+          if (tableFunctionRegistry.functionExists(identifier)) {
+            handleViewContext(
+              name, Option(tableFunctionRegistry.lookupFunction(identifier, arguments)))
+          } else {
+            None
+          }
+        }
+    }
+  }
+
+  /**
+   * Look up the `ExpressionInfo` of the given function by name.
+   * Resolution order follows the configured path (e.g. builtin then session).
+   * This only supports scalar functions.
+   */
+  def lookupBuiltinOrTempFunction(name: String): Option[ExpressionInfo] = {
+    lookupFunctionWithShadowing(name, functionRegistry, checkBuiltinOperators = true)
+  }
+
+  /**
+   * Look up the `ExpressionInfo` of the given function by name.
+   * Resolution order follows the configured path (e.g. builtin then session).
+   */
+  def lookupBuiltinOrTempTableFunction(name: String): Option[ExpressionInfo] = synchronized {
+    lookupFunctionWithShadowing(name, tableFunctionRegistry, checkBuiltinOperators = false)
+  }
+
+  /**
+   * Look up a scalar function by name and resolve it to an Expression.
+   * Resolution order follows the configured path (e.g. builtin then session).
+   */
+  def resolveBuiltinOrTempFunction(name: String, arguments: Seq[Expression]): Option[Expression] =
+    resolveFunctionWithFallback(name, arguments, functionRegistry)
+
+  /**
+   * Look up a table function by name and resolve it to a LogicalPlan.
+   * Resolution order follows the configured path (e.g. builtin then session);
+   * extension functions are stored in the builtin namespace.
+   *
+   * For unqualified names, use [[resolveBuiltinOrTempTableFunctionRespectingPathOrder]] so that
+   * if a scalar function appears before a table function in the path, the caller can throw
+   * NOT_A_TABLE_FUNCTION (consistent with scalar context where table-first yields NOT_A_SCALAR).
+   */
+  def resolveBuiltinOrTempTableFunction(
+      name: String,
+      arguments: Seq[Expression]): Option[LogicalPlan] =
+    resolveFunctionWithFallback(name, arguments, tableFunctionRegistry)
+
+  /**
+   * Resolves functions using PATH-based resolution.
+   * Searches through the resolution path, returning the first function found.
+   *
+   * @param name The function name (unqualified).
+   * @param arguments The arguments to pass to the function.
+   * @param registry The registry to search (FunctionRegistry or TableFunctionRegistry).
+   * @tparam T The registry's type parameter (Expression for FunctionRegistry,
+   *           LogicalPlan for TableFunctionRegistry).
+   * @return Resolved function if found, None otherwise.
+   */
+  private def resolveFunctionWithFallback[T](
+      name: String,
+      arguments: Seq[Expression],
+      registry: FunctionRegistryBase[T]): Option[T] = {
+
+    // Use PATH-based resolution: iterate through namespaces until a match is found.
+    val path = resolutionPath()
+
+    // Use iterator for short-circuit evaluation (stops at first match).
+    path.iterator.flatMap { namespace =>
+      resolveInNamespace(namespace, name, arguments, registry)
+    }.nextOption()
+  }
+
+  /**
+   * Look up a persistent function's ExpressionInfo by name (for DESCRIBE FUNCTION).
+   * This only fetches metadata without loading resources or creating builders.
+   */
+  def lookupPersistentFunction(name: FunctionIdentifier): ExpressionInfo = {
+    val qualifiedIdent = qualifyIdentifier(name)
+    // Check if already cached in either registry
+    functionRegistry.lookupFunction(qualifiedIdent)
+      .orElse(tableFunctionRegistry.lookupFunction(qualifiedIdent))
+      .getOrElse {
+        val funcMetadata = fetchCatalogFunction(qualifiedIdent)
+        if (funcMetadata.isUserDefinedFunction) {
+          UserDefinedFunction.fromCatalogFunction(funcMetadata, parser).toExpressionInfo
+          } else {
+          makeExprInfoForHiveFunction(funcMetadata)
+        }
+      }
+  }
+
+  /**
+   * Load a persistent scalar function by name.
+   * Returns V1Function with:
+   * - Eager info (from cache or catalog fetch, no resource loading)
+   * - Lazy builder (resource loading only on first invoke)
+   *
+   * This matches V1 behavior where DESCRIBE doesn't load resources.
+   */
+  def loadPersistentScalarFunction(name: FunctionIdentifier): V1Function = {
+    val qualifiedIdent = qualifyIdentifier(name)
+
+    // Check cache first (no synchronization needed for reads)
+    functionRegistry.lookupFunctionEntry(qualifiedIdent) match {
+      case Some((cachedInfo, cachedBuilder)) =>
+        // Already cached - return with eager builder
+        V1Function(cachedInfo, cachedBuilder)
+
+      case None =>
+        // Fetch metadata eagerly (no resource loading yet)
+        val funcMetadata = fetchCatalogFunction(qualifiedIdent)
+        val info = if (funcMetadata.isUserDefinedFunction) {
+          UserDefinedFunction.fromCatalogFunction(funcMetadata, parser).toExpressionInfo
+        } else {
+          makeExprInfoForHiveFunction(funcMetadata)
+        }
+
+        // Builder factory - loads resources only on first invoke()
+        val builderFactory: () => FunctionBuilder = () => synchronized {
+          // Re-check cache (another thread may have loaded it)
+          functionRegistry.lookupFunctionBuilder(qualifiedIdent).getOrElse {
+            if (funcMetadata.isUserDefinedFunction) {
+              val udf = UserDefinedFunction.fromCatalogFunction(funcMetadata, parser)
+              registerUserDefinedFunction[Expression](
+                udf,
+                overrideIfExists = false,
+                functionRegistry,
+                makeUserDefinedScalarFuncBuilder(udf))
+            } else {
+              loadFunctionResources(funcMetadata.resources)
+              registerFunction(
+                funcMetadata,
+                overrideIfExists = false,
+                functionRegistry,
+                makeFunctionBuilder(funcMetadata))
+            }
+            functionRegistry.lookupFunctionBuilder(qualifiedIdent).get
+          }
+        }
+
+        V1Function(info, builderFactory)
+    }
+  }
+
+  /**
+   * Look up a persistent table function by name and resolves it to a LogicalPlan.
+   */
+  def resolvePersistentTableFunction(
+      name: FunctionIdentifier,
+      arguments: Seq[Expression]): LogicalPlan = synchronized {
+    val qualifiedIdent = qualifyIdentifier(name)
+    if (tableFunctionRegistry.functionExists(qualifiedIdent)) {
+      // Already cached
+      tableFunctionRegistry.lookupFunction(qualifiedIdent, arguments)
+    } else {
+      // Load from catalog
+      val funcMetadata = fetchCatalogFunction(qualifiedIdent)
+      if (!funcMetadata.isUserDefinedFunction) {
+        // Hive table functions are not supported
+        failFunctionLookup(qualifiedIdent)
+      }
+      val udf = UserDefinedFunction.fromCatalogFunction(funcMetadata, parser)
+      registerUserDefinedFunction[LogicalPlan](
+        udf,
+        overrideIfExists = false,
+        tableFunctionRegistry,
+        makeUserDefinedTableFuncBuilder(udf))
+      tableFunctionRegistry.lookupFunction(qualifiedIdent, arguments)
+    }
+  }
+
+  /**
+   * Fetch a catalog function from the external catalog.
+   */
+  private def fetchCatalogFunction(qualifiedIdent: FunctionIdentifier): CatalogFunction = {
+    val db = qualifiedIdent.database.get
+    val funcName = qualifiedIdent.funcName
+    requireDbExists(db)
+    try {
+      // Please note that qualifiedIdent is provided by the user. However,
+      // CatalogFunction.identifier is returned by the underlying catalog.
+      // So, it is possible that qualifiedIdent is not exactly the same as
+      // catalogFunction.identifier (difference is on case-sensitivity).
+      // At here, we preserve the input from the user.
+      externalCatalog.getFunction(db, funcName).copy(identifier = qualifiedIdent)
+    } catch {
+      case _: NoSuchPermanentFunctionException | _: NoSuchFunctionException =>
+        failFunctionLookup(qualifiedIdent)
+    }
   }
 
   /**
    * Look up the [[ExpressionInfo]] associated with the specified function, assuming it exists.
    */
   def lookupFunctionInfo(name: FunctionIdentifier): ExpressionInfo = synchronized {
-    // TODO: just make function registry take in FunctionIdentifier instead of duplicating this
-    val database = name.database.orElse(Some(currentDb)).map(formatDatabaseName)
-    val qualifiedName = name.copy(database = database)
-    functionRegistry.lookupFunction(name)
-      .orElse(functionRegistry.lookupFunction(qualifiedName))
-      .getOrElse {
-        val db = qualifiedName.database.get
-        requireDbExists(db)
-        if (externalCatalog.functionExists(db, name.funcName)) {
-          val metadata = externalCatalog.getFunction(db, name.funcName)
-          new ExpressionInfo(
-            metadata.className,
-            qualifiedName.database.orNull,
-            qualifiedName.identifier)
-        } else {
-          failFunctionLookup(name)
-        }
-      }
+    if (name.database.isEmpty) {
+      lookupBuiltinOrTempFunction(name.funcName)
+        .orElse(lookupBuiltinOrTempTableFunction(name.funcName))
+        .getOrElse(lookupPersistentFunction(name))
+    } else {
+      lookupPersistentFunction(name)
+    }
+  }
+
+  // The actual function lookup logic looks up temp/built-in function first, then persistent
+  // function from either v1 or v2 catalog. This method only look up v1 catalog.
+  def lookupFunction(name: FunctionIdentifier, children: Seq[Expression]): Expression = {
+    if (name.database.isEmpty) {
+      resolveBuiltinOrTempFunction(name.funcName, children)
+        .getOrElse(loadPersistentScalarFunction(name).invoke(children))
+    } else {
+      loadPersistentScalarFunction(name).invoke(children)
+    }
+  }
+
+  def lookupTableFunction(name: FunctionIdentifier, children: Seq[Expression]): LogicalPlan = {
+    if (name.database.isEmpty) {
+      resolveBuiltinOrTempTableFunction(name.funcName, children)
+        .getOrElse(resolvePersistentTableFunction(name, children))
+    } else {
+      resolvePersistentTableFunction(name, children)
+    }
   }
 
   /**
-   * Return an [[Expression]] that represents the specified function, assuming it exists.
-   *
-   * For a temporary function or a permanent function that has been loaded,
-   * this method will simply lookup the function through the
-   * FunctionRegistry and create an expression based on the builder.
-   *
-   * For a permanent function that has not been loaded, we will first fetch its metadata
-   * from the underlying external catalog. Then, we will load all resources associated
-   * with this function (i.e. jars and files). Finally, we create a function builder
-   * based on the function class and put the builder into the FunctionRegistry.
-   * The name of this function in the FunctionRegistry will be `databaseName.functionName`.
+   * List all built-in and temporary functions with the given pattern.
    */
-  def lookupFunction(
-      name: FunctionIdentifier,
-      children: Seq[Expression]): Expression = synchronized {
-    // Note: the implementation of this function is a little bit convoluted.
-    // We probably shouldn't use a single FunctionRegistry to register all three kinds of functions
-    // (built-in, temp, and external).
-    if (name.database.isEmpty && functionRegistry.functionExists(name)) {
-      // This function has been already loaded into the function registry.
-      return functionRegistry.lookupFunction(name, children)
+  private def listBuiltinAndTempFunctions(pattern: String): Seq[FunctionIdentifier] = {
+    val functions = (functionRegistry.listFunction() ++ tableFunctionRegistry.listFunction())
+      .filter(f =>
+        f.database.isEmpty ||
+        isTempFunctionIdentifier(f))
+      .map(f => if (isTempFunctionIdentifier(f)) {
+        FunctionIdentifier(f.funcName)
+      } else {
+        f
+      })
+    StringUtils.filterPattern(functions.map(_.unquotedString), pattern).map { f =>
+      // In functionRegistry, function names are stored as an unquoted format.
+      Try(parser.parseFunctionIdentifier(f)) match {
+        case Success(e) => e
+        case Failure(_) =>
+          // The names of some built-in functions are not parsable by our parser, e.g., %
+          FunctionIdentifier(f)
+      }
     }
-
-    // If the name itself is not qualified, add the current database to it.
-    val database = formatDatabaseName(name.database.getOrElse(getCurrentDatabase))
-    val qualifiedName = name.copy(database = Some(database))
-
-    if (functionRegistry.functionExists(qualifiedName)) {
-      // This function has been already loaded into the function registry.
-      // Unlike the above block, we find this function by using the qualified name.
-      return functionRegistry.lookupFunction(qualifiedName, children)
-    }
-
-    // The function has not been loaded to the function registry, which means
-    // that the function is a permanent function (if it actually has been registered
-    // in the metastore). We need to first put the function in the FunctionRegistry.
-    // TODO: why not just check whether the function exists first?
-    val catalogFunction = try {
-      externalCatalog.getFunction(database, name.funcName)
-    } catch {
-      case _: AnalysisException => failFunctionLookup(name)
-      case _: NoSuchPermanentFunctionException => failFunctionLookup(name)
-    }
-    loadFunctionResources(catalogFunction.resources)
-    // Please note that qualifiedName is provided by the user. However,
-    // catalogFunction.identifier.unquotedString is returned by the underlying
-    // catalog. So, it is possible that qualifiedName is not exactly the same as
-    // catalogFunction.identifier.unquotedString (difference is on case-sensitivity).
-    // At here, we preserve the input from the user.
-    registerFunction(catalogFunction.copy(identifier = qualifiedName), overrideIfExists = false)
-    // Now, we need to create the Expression.
-    functionRegistry.lookupFunction(qualifiedName, children)
   }
 
   /**
@@ -1289,29 +2776,31 @@ class SessionCatalog(
    * defined).
    */
   def listFunctions(db: String, pattern: String): Seq[(FunctionIdentifier, String)] = {
-    val dbName = formatDatabaseName(db)
+    val dbName = format(db)
     requireDbExists(dbName)
     val dbFunctions = externalCatalog.listFunctions(dbName, pattern).map { f =>
       FunctionIdentifier(f, Some(dbName)) }
-    val loadedFunctions = StringUtils
-      .filterPattern(functionRegistry.listFunction().map(_.unquotedString), pattern).map { f =>
-        // In functionRegistry, function names are stored as an unquoted format.
-        Try(parser.parseFunctionIdentifier(f)) match {
-          case Success(e) => e
-          case Failure(_) =>
-            // The names of some built-in functions are not parsable by our parser, e.g., %
-            FunctionIdentifier(f)
-        }
-      }
+    val loadedFunctions = listBuiltinAndTempFunctions(pattern)
     val functions = dbFunctions ++ loadedFunctions
     // The session catalog caches some persistent functions in the FunctionRegistry
     // so there can be duplicates.
     functions.map {
       case f if FunctionRegistry.functionSet.contains(f) => (f, "SYSTEM")
+      case f if TableFunctionRegistry.functionSet.contains(f) => (f, "SYSTEM")
+      case f if f.database.isDefined => (qualifyIdentifier(f), "USER")
       case f => (f, "USER")
     }.distinct
   }
 
+  /**
+   * List all temporary functions.
+   */
+  def listTemporaryFunctions(): Seq[FunctionIdentifier] = {
+    (functionRegistry.listFunction() ++ tableFunctionRegistry.listFunction())
+      .filter(isTempFunctionIdentifier)
+      // Strip the TEMP_FUNCTION_DB database qualifier
+      .map(ident => FunctionIdentifier(ident.funcName))
+  }
 
   // -----------------
   // | Other methods |
@@ -1332,16 +2821,14 @@ class SessionCatalog(
     listTables(DEFAULT_DATABASE).foreach { table =>
       dropTable(table, ignoreIfNotExists = false, purge = false)
     }
-    listFunctions(DEFAULT_DATABASE).map(_._1).foreach { func =>
-      if (func.database.isDefined) {
-        dropFunction(func, ignoreIfNotExists = false)
-      } else {
-        dropTempFunction(func.funcName, ignoreIfNotExists = false)
-      }
-    }
+    // Temp functions are dropped below, we only need to drop permanent functions here.
+    externalCatalog.listFunctions(DEFAULT_DATABASE, "*").map { f =>
+      FunctionIdentifier(f, Some(DEFAULT_DATABASE))
+    }.foreach(dropFunction(_, ignoreIfNotExists = false))
     clearTempTables()
     globalTempViewManager.clear()
     functionRegistry.clear()
+    tableFunctionRegistry.clear()
     tableRelationCache.invalidateAll()
     // restore built-in functions
     FunctionRegistry.builtin.listFunction().foreach { f =>
@@ -1350,6 +2837,14 @@ class SessionCatalog(
       require(expressionInfo.isDefined, s"built-in function '$f' is missing expression info")
       require(functionBuilder.isDefined, s"built-in function '$f' is missing function builder")
       functionRegistry.registerFunction(f, expressionInfo.get, functionBuilder.get)
+    }
+    // restore built-in table functions
+    TableFunctionRegistry.builtin.listFunction().foreach { f =>
+      val expressionInfo = TableFunctionRegistry.builtin.lookupFunction(f)
+      val functionBuilder = TableFunctionRegistry.builtin.lookupFunctionBuilder(f)
+      require(expressionInfo.isDefined, s"built-in function '$f' is missing expression info")
+      require(functionBuilder.isDefined, s"built-in function '$f' is missing function builder")
+      tableFunctionRegistry.registerFunction(f, expressionInfo.get, functionBuilder.get)
     }
   }
 
@@ -1365,5 +2860,28 @@ class SessionCatalog(
     target.currentDb = currentDb
     // copy over temporary views
     tempViews.foreach(kv => target.tempViews.put(kv._1, kv._2))
+  }
+
+  /**
+   * Validate the new location before renaming a managed table, which should be non-existent.
+   */
+  private def validateNewLocationOfRename(
+      oldName: TableIdentifier,
+      newName: TableIdentifier): Unit = {
+    requireTableExists(oldName)
+    requireTableNotExists(newName)
+    val oldTable = getTableMetadata(oldName)
+    if (oldTable.tableType == CatalogTableType.MANAGED) {
+      assert(oldName.database.nonEmpty,
+        "Table identifier " + oldName.quotedString + " is missing database name. " +
+        "Managed tables must have a database defined.")
+      val databaseLocation =
+        externalCatalog.getDatabase(oldName.database.get).locationUri
+      val newTableLocation = new Path(new Path(databaseLocation), format(newName.table))
+      val fs = newTableLocation.getFileSystem(hadoopConf)
+      if (fs.exists(newTableLocation)) {
+        throw QueryExecutionErrors.locationAlreadyExists(newName, newTableLocation)
+      }
+    }
   }
 }

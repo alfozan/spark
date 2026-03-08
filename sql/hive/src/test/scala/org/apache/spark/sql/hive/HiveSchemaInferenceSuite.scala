@@ -18,10 +18,9 @@
 package org.apache.spark.sql.hive
 
 import java.io.File
+import java.util.Locale
 
 import scala.util.Random
-
-import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -34,7 +33,7 @@ import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
 
 class HiveSchemaInferenceSuite
-  extends QueryTest with TestHiveSingleton with SQLTestUtils with BeforeAndAfterEach {
+  extends QueryTest with TestHiveSingleton with SQLTestUtils {
 
   import HiveSchemaInferenceSuite._
   import HiveExternalCatalog.DATASOURCE_SCHEMA_PREFIX
@@ -56,7 +55,7 @@ class HiveSchemaInferenceSuite
 
   // Return a copy of the given schema with all field names converted to lower case.
   private def lowerCaseSchema(schema: StructType): StructType = {
-    StructType(schema.map(f => f.copy(name = f.name.toLowerCase)))
+    StructType(schema.map(f => f.copy(name = f.name.toLowerCase(Locale.ROOT))))
   }
 
   // Create a Hive external test table containing the given field and partition column names.
@@ -78,7 +77,7 @@ class HiveSchemaInferenceSuite
     val partitionStructFields = partitionCols.map { field =>
       StructField(
         // Partition column case isn't preserved
-        name = field.toLowerCase,
+        name = field.toLowerCase(Locale.ROOT),
         dataType = IntegerType,
         nullable = true,
         metadata = Metadata.empty)
@@ -108,19 +107,15 @@ class HiveSchemaInferenceSuite
           locationUri = Option(dir.toURI),
           inputFormat = serde.inputFormat,
           outputFormat = serde.outputFormat,
+          serdeName = None,
           serde = serde.serde,
           compressed = false,
           properties = Map("serialization.format" -> "1")),
         schema = schema,
         provider = Option("hive"),
-        partitionColumnNames = partitionCols.map(_.toLowerCase),
+        partitionColumnNames = partitionCols.map(_.toLowerCase(Locale.ROOT)),
         properties = Map.empty),
       true)
-
-    // Add partition records (if specified)
-    if (!partitionCols.isEmpty) {
-      spark.catalog.recoverPartitions(TEST_TABLE_NAME)
-    }
 
     // Check that the table returned by HiveExternalCatalog has schemaPreservesCase set to false
     // and that the raw table returned by the Hive client doesn't have any Spark SQL properties
@@ -128,7 +123,13 @@ class HiveSchemaInferenceSuite
     // properties out).
     assert(!externalCatalog.getTable(DATABASE, TEST_TABLE_NAME).schemaPreservesCase)
     val rawTable = client.getTable(DATABASE, TEST_TABLE_NAME)
-    assert(rawTable.properties.filterKeys(_.startsWith(DATASOURCE_SCHEMA_PREFIX)) == Map.empty)
+    assert(!rawTable.properties.exists { case (k, _) => k.startsWith(DATASOURCE_SCHEMA_PREFIX) })
+
+    // Add partition records (if specified)
+    if (!partitionCols.isEmpty) {
+      spark.catalog.recoverPartitions(TEST_TABLE_NAME)
+    }
+
     schema
   }
 
@@ -156,12 +157,10 @@ class HiveSchemaInferenceSuite
       SQLConf.HIVE_CASE_SENSITIVE_INFERENCE.key -> mode.toString)(f)
   }
 
-  private val inferenceKey = SQLConf.HIVE_CASE_SENSITIVE_INFERENCE.key
-
   private def testFieldQuery(fields: Seq[String]): Unit = {
     if (!fields.isEmpty) {
       val query = s"SELECT * FROM ${TEST_TABLE_NAME} WHERE ${Random.shuffle(fields).head} >= 0"
-      assert(spark.sql(query).count == NUM_RECORDS)
+      assert(spark.sql(query).count() == NUM_RECORDS)
     }
   }
 
@@ -180,7 +179,7 @@ class HiveSchemaInferenceSuite
           val catalogTable = externalCatalog.getTable(DATABASE, TEST_TABLE_NAME)
           assert(catalogTable.schemaPreservesCase)
           assert(catalogTable.schema == schema)
-          assert(catalogTable.partitionColumnNames == partCols.map(_.toLowerCase))
+          assert(catalogTable.partitionColumnNames == partCols.map(_.toLowerCase(Locale.ROOT)))
         }
       }
     }
@@ -262,6 +261,32 @@ class HiveSchemaInferenceSuite
         StructType(Seq(StructField("lower", StringType, nullable = false))),
         StructType(Seq(StructField("lowerCase", BinaryType))))
     }
+
+    // Parquet schema is subset of metaStore schema and has uppercase field name
+    assertResult(
+      StructType(Seq(
+        StructField("UPPERCase", DoubleType, nullable = true),
+        StructField("lowerCase", BinaryType, nullable = true)))) {
+
+      HiveMetastoreCatalog.mergeWithMetastoreSchema(
+        StructType(Seq(
+          StructField("UPPERCase", DoubleType, nullable = true),
+          StructField("lowerCase", BinaryType, nullable = true))),
+
+        StructType(Seq(
+          StructField("lowerCase", BinaryType, nullable = true))))
+    }
+
+    // Metastore schema contains additional nullable fields.
+    assert(intercept[Throwable] {
+      HiveMetastoreCatalog.mergeWithMetastoreSchema(
+        StructType(Seq(
+          StructField("UPPERCase", DoubleType, nullable = false),
+          StructField("lowerCase", BinaryType, nullable = true))),
+
+        StructType(Seq(
+          StructField("lowerCase", BinaryType, nullable = true))))
+    }.getMessage.contains("Detected conflicting schemas"))
 
     // Check that merging missing nullable fields works as expected.
     assertResult(

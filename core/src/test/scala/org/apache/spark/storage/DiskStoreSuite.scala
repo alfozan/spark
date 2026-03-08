@@ -18,12 +18,13 @@
 package org.apache.spark.storage
 
 import java.nio.{ByteBuffer, MappedByteBuffer}
+import java.nio.file.Files
 import java.util.{Arrays, Random}
 
-import com.google.common.io.{ByteStreams, Files}
 import io.netty.channel.FileRegion
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
+import org.apache.spark.internal.config
 import org.apache.spark.network.util.{ByteArrayWritableChannel, JavaUtils}
 import org.apache.spark.security.CryptoStreamUtils
 import org.apache.spark.util.Utils
@@ -38,14 +39,14 @@ class DiskStoreSuite extends SparkFunSuite {
     // It will cause error when we tried to re-open the filestore and the
     // memory-mapped byte buffer tot he file has not been GC on Windows.
     assume(!Utils.isWindows)
-    val confKey = "spark.storage.memoryMapThreshold"
+    val confKey = config.STORAGE_MEMORY_MAP_THRESHOLD.key
 
     // Create a non-trivial (not all zeros) byte array
     val bytes = Array.tabulate[Byte](1000)(_.toByte)
     val byteBuffer = new ChunkedByteBuffer(ByteBuffer.wrap(bytes))
 
     val blockId = BlockId("rdd_1_2")
-    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true)
+    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true, isDriver = false)
 
     val diskStoreMapped = new DiskStore(conf.clone().set(confKey, "0"), diskBlockManager,
       securityManager)
@@ -76,7 +77,7 @@ class DiskStoreSuite extends SparkFunSuite {
 
   test("block size tracking") {
     val conf = new SparkConf()
-    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true)
+    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true, isDriver = false)
     val diskStore = new DiskStore(conf, diskBlockManager, new SecurityManager(conf))
 
     val blockId = BlockId("rdd_1_2")
@@ -94,8 +95,8 @@ class DiskStoreSuite extends SparkFunSuite {
 
   test("blocks larger than 2gb") {
     val conf = new SparkConf()
-      .set("spark.storage.memoryMapLimitForTests", "10k" )
-    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true)
+      .set(config.MEMORY_MAP_LIMIT_FOR_TESTS.key, "10k")
+    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true, isDriver = false)
     val diskStore = new DiskStore(conf, diskBlockManager, new SecurityManager(conf))
 
     val blockId = BlockId("rdd_1_2")
@@ -116,7 +117,7 @@ class DiskStoreSuite extends SparkFunSuite {
 
     val chunkedByteBuffer = blockData.toChunkedByteBuffer(ByteBuffer.allocate)
     val chunks = chunkedByteBuffer.chunks
-    assert(chunks.size === 2)
+    assert(chunks.length === 2)
     for (chunk <- chunks) {
       assert(chunk.limit() === 10 * 1024)
     }
@@ -127,17 +128,16 @@ class DiskStoreSuite extends SparkFunSuite {
 
     assert(e.getMessage ===
       s"requirement failed: can't create a byte buffer of size ${blockData.size}" +
-      " since it exceeds 10.0 KB.")
+      " since it exceeds 10.0 KiB.")
   }
 
   test("block data encryption") {
-    val testDir = Utils.createTempDir()
     val testData = new Array[Byte](128 * 1024)
     new Random().nextBytes(testData)
 
     val conf = new SparkConf()
     val securityManager = new SecurityManager(conf, Some(CryptoStreamUtils.createKey(conf)))
-    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true)
+    val diskBlockManager = new DiskBlockManager(conf, deleteFilesOnStop = true, isDriver = false)
     val diskStore = new DiskStore(conf, diskBlockManager, securityManager)
 
     val blockId = BlockId("rdd_1_2")
@@ -150,7 +150,7 @@ class DiskStoreSuite extends SparkFunSuite {
 
     assert(diskStore.getSize(blockId) === testData.length)
 
-    val diskData = Files.toByteArray(diskBlockManager.getFile(blockId.name))
+    val diskData = Files.readAllBytes(diskBlockManager.getFile(blockId.name).toPath)
     assert(!Arrays.equals(testData, diskData))
 
     val blockData = diskStore.getBytes(blockId)
@@ -171,7 +171,7 @@ class DiskStoreSuite extends SparkFunSuite {
   private def readViaInputStream(data: BlockData): Array[Byte] = {
     val is = data.toInputStream()
     try {
-      ByteStreams.toByteArray(is)
+      is.readAllBytes()
     } finally {
       is.close()
     }
@@ -194,8 +194,8 @@ class DiskStoreSuite extends SparkFunSuite {
     val region = data.toNetty().asInstanceOf[FileRegion]
     val byteChannel = new ByteArrayWritableChannel(data.size.toInt)
 
-    while (region.transfered() < region.count()) {
-      region.transferTo(byteChannel, region.transfered())
+    while (region.transferred() < region.count()) {
+      region.transferTo(byteChannel, region.transferred())
     }
 
     byteChannel.close()

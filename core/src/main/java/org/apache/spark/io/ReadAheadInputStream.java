@@ -1,9 +1,12 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,13 +16,6 @@
  */
 package org.apache.spark.io;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
-import org.apache.spark.util.ThreadUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.annotation.concurrent.GuardedBy;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -30,6 +26,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import javax.annotation.concurrent.GuardedBy;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
+import org.apache.spark.network.util.JavaUtils;
+import org.apache.spark.util.ThreadUtils;
 
 /**
  * {@link InputStream} implementation which asynchronously reads ahead from the underlying input
@@ -42,7 +46,8 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public class ReadAheadInputStream extends InputStream {
 
-  private static final Logger logger = LoggerFactory.getLogger(ReadAheadInputStream.class);
+  private static final SparkLogger logger =
+    SparkLoggerFactory.getLogger(ReadAheadInputStream.class);
 
   private ReentrantLock stateChangeLock = new ReentrantLock();
 
@@ -89,8 +94,6 @@ public class ReadAheadInputStream extends InputStream {
 
   private final Condition asyncReadComplete = stateChangeLock.newCondition();
 
-  private static final ThreadLocal<byte[]> oneByte = ThreadLocal.withInitial(() -> new byte[1]);
-
   /**
    * Creates a <code>ReadAheadInputStream</code> with the specified buffer size and read-ahead
    * threshold
@@ -100,7 +103,7 @@ public class ReadAheadInputStream extends InputStream {
    */
   public ReadAheadInputStream(
       InputStream inputStream, int bufferSizeInBytes) {
-    Preconditions.checkArgument(bufferSizeInBytes > 0,
+    JavaUtils.checkArgument(bufferSizeInBytes > 0,
         "bufferSizeInBytes should be greater than 0, but the value is " + bufferSizeInBytes);
     activeBuffer = ByteBuffer.allocate(bufferSizeInBytes);
     readAheadBuffer = ByteBuffer.allocate(bufferSizeInBytes);
@@ -115,7 +118,10 @@ public class ReadAheadInputStream extends InputStream {
 
   private void checkReadException() throws IOException {
     if (readAborted) {
-      Throwables.propagateIfPossible(readException, IOException.class);
+      if (readException == null) throw new NullPointerException("readException is not captured.");
+      if (readException instanceof IOException ie) throw ie;
+      if (readException instanceof Error error) throw error;
+      if (readException instanceof RuntimeException re) throw re;
       throw new IOException(readException);
     }
   }
@@ -135,62 +141,58 @@ public class ReadAheadInputStream extends InputStream {
     } finally {
       stateChangeLock.unlock();
     }
-    executorService.execute(new Runnable() {
-
-      @Override
-      public void run() {
-        stateChangeLock.lock();
-        try {
-          if (isClosed) {
-            readInProgress = false;
-            return;
-          }
-          // Flip this so that the close method will not close the underlying input stream when we
-          // are reading.
-          isReading = true;
-        } finally {
-          stateChangeLock.unlock();
-        }
-
-        // Please note that it is safe to release the lock and read into the read ahead buffer
-        // because either of following two conditions will hold - 1. The active buffer has
-        // data available to read so the reader will not read from the read ahead buffer.
-        // 2. This is the first time read is called or the active buffer is exhausted,
-        // in that case the reader waits for this async read to complete.
-        // So there is no race condition in both the situations.
-        int read = 0;
-        int off = 0, len = arr.length;
-        Throwable exception = null;
-        try {
-          // try to fill the read ahead buffer.
-          // if a reader is waiting, possibly return early.
-          do {
-            read = underlyingInputStream.read(arr, off, len);
-            if (read <= 0) break;
-            off += read;
-            len -= read;
-          } while (len > 0 && !isWaiting.get());
-        } catch (Throwable ex) {
-          exception = ex;
-          if (ex instanceof Error) {
-            // `readException` may not be reported to the user. Rethrow Error to make sure at least
-            // The user can see Error in UncaughtExceptionHandler.
-            throw (Error) ex;
-          }
-        } finally {
-          stateChangeLock.lock();
-          readAheadBuffer.limit(off);
-          if (read < 0 || (exception instanceof EOFException)) {
-            endOfStream = true;
-          } else if (exception != null) {
-            readAborted = true;
-            readException = exception;
-          }
+    executorService.execute(() -> {
+      stateChangeLock.lock();
+      try {
+        if (isClosed) {
           readInProgress = false;
-          signalAsyncReadComplete();
-          stateChangeLock.unlock();
-          closeUnderlyingInputStreamIfNecessary();
+          return;
         }
+        // Flip this so that the close method will not close the underlying input stream when we
+        // are reading.
+        isReading = true;
+      } finally {
+        stateChangeLock.unlock();
+      }
+
+      // Please note that it is safe to release the lock and read into the read ahead buffer
+      // because either of following two conditions will hold - 1. The active buffer has
+      // data available to read so the reader will not read from the read ahead buffer.
+      // 2. This is the first time read is called or the active buffer is exhausted,
+      // in that case the reader waits for this async read to complete.
+      // So there is no race condition in both the situations.
+      int read = 0;
+      int off = 0, len = arr.length;
+      Throwable exception = null;
+      try {
+        // try to fill the read ahead buffer.
+        // if a reader is waiting, possibly return early.
+        do {
+          read = underlyingInputStream.read(arr, off, len);
+          if (read <= 0) break;
+          off += read;
+          len -= read;
+        } while (len > 0 && !isWaiting.get());
+      } catch (Throwable ex) {
+        exception = ex;
+        if (ex instanceof Error error) {
+          // `readException` may not be reported to the user. Rethrow Error to make sure at least
+          // The user can see Error in UncaughtExceptionHandler.
+          throw error;
+        }
+      } finally {
+        stateChangeLock.lock();
+        readAheadBuffer.limit(off);
+        if (read < 0 || (exception instanceof EOFException)) {
+          endOfStream = true;
+        } else if (exception != null) {
+          readAborted = true;
+          readException = exception;
+        }
+        readInProgress = false;
+        signalAsyncReadComplete();
+        stateChangeLock.unlock();
+        closeUnderlyingInputStreamIfNecessary();
       }
     });
   }
@@ -211,7 +213,7 @@ public class ReadAheadInputStream extends InputStream {
       try {
         underlyingInputStream.close();
       } catch (IOException e) {
-        logger.warn(e.getMessage(), e);
+        logger.warn("{}", e, MDC.of(LogKeys.ERROR, e.getMessage()));
       }
     }
   }
@@ -251,7 +253,7 @@ public class ReadAheadInputStream extends InputStream {
       // short path - just get one byte.
       return activeBuffer.get() & 0xFF;
     } else {
-      byte[] oneByteArray = oneByte.get();
+      byte[] oneByteArray = new byte[1];
       return read(oneByteArray, 0, 1) == -1 ? -1 : oneByteArray[0] & 0xFF;
     }
   }
@@ -306,7 +308,7 @@ public class ReadAheadInputStream extends InputStream {
     stateChangeLock.lock();
     // Make sure we have no integer overflow.
     try {
-      return (int) Math.min((long) Integer.MAX_VALUE,
+      return (int) Math.min(Integer.MAX_VALUE,
           (long) activeBuffer.remaining() + readAheadBuffer.remaining());
     } finally {
       stateChangeLock.unlock();

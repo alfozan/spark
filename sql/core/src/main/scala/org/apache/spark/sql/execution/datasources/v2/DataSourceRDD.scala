@@ -17,53 +17,219 @@
 
 package org.apache.spark.sql.execution.datasources.v2
 
-import scala.collection.JavaConverters._
-import scala.reflect.ClassTag
+import java.util.concurrent.ConcurrentHashMap
 
-import org.apache.spark.{InterruptibleIterator, Partition, SparkContext, TaskContext}
+import scala.language.existentials
+
+import org.apache.spark._
+import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.sources.v2.reader.InputPartition
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric}
+import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.ArrayImplicits._
 
-class DataSourceRDDPartition[T : ClassTag](val index: Int, val inputPartition: InputPartition[T])
+class DataSourceRDDPartition(val index: Int, val inputPartitions: Seq[InputPartition])
   extends Partition with Serializable
 
-class DataSourceRDD[T: ClassTag](
+/**
+ * Holds the state for a reader in a task, used by the completion listener to access the most
+ * recently created reader and iterator for final metrics updates and cleanup.
+ *
+ * When `compute()` is called multiple times for the same task (e.g., when DataSourceRDD is
+ * coalesced), this state is updated on each call to track the most recent reader. The task
+ * completion listener then uses this most recent reader for final cleanup and metrics reporting.
+ *
+ * @param reader The partition reader
+ * @param iterator The metrics iterator wrapping the reader
+ */
+private case class ReaderState(reader: PartitionReader[_], iterator: MetricsIterator[_])
+
+// TODO: we should have 2 RDDs: an RDD[InternalRow] for row-based scan, an `RDD[ColumnarBatch]` for
+// columnar scan.
+class DataSourceRDD(
     sc: SparkContext,
-    @transient private val inputPartitions: Seq[InputPartition[T]])
-  extends RDD[T](sc, Nil) {
+    @transient private val inputPartitions: Seq[Seq[InputPartition]],
+    partitionReaderFactory: PartitionReaderFactory,
+    columnarReads: Boolean,
+    customMetrics: Map[String, SQLMetric])
+  extends RDD[InternalRow](sc, Nil) {
+
+  // Map from task attempt ID to the most recently created ReaderState for that task.
+  // When compute() is called multiple times for the same task (due to coalescing), the map entry
+  // is updated each time so the completion listener always closes the last reader.
+  @transient private lazy val taskReaderStates = new ConcurrentHashMap[Long, ReaderState]()
 
   override protected def getPartitions: Array[Partition] = {
     inputPartitions.zipWithIndex.map {
-      case (inputPartition, index) => new DataSourceRDDPartition(index, inputPartition)
+      case (inputPartitions, index) => new DataSourceRDDPartition(index, inputPartitions)
     }.toArray
   }
 
-  override def compute(split: Partition, context: TaskContext): Iterator[T] = {
-    val reader = split.asInstanceOf[DataSourceRDDPartition[T]].inputPartition
-        .createPartitionReader()
-    context.addTaskCompletionListener(_ => reader.close())
-    val iter = new Iterator[T] {
-      private[this] var valuePrepared = false
+  private def castPartition(split: Partition): DataSourceRDDPartition = split match {
+    case p: DataSourceRDDPartition => p
+    case _ => throw QueryExecutionErrors.notADatasourceRDDPartitionError(split)
+  }
 
-      override def hasNext: Boolean = {
-        if (!valuePrepared) {
-          valuePrepared = reader.next()
-        }
-        valuePrepared
-      }
+  override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
+    val taskAttemptId = context.taskAttemptId()
 
-      override def next(): T = {
-        if (!hasNext) {
-          throw new java.util.NoSuchElementException("End of stream")
+    // Add completion listener only once per task attempt. When compute() is called a second time
+    // for the same task (e.g., due to coalescing), the first call will have already put a
+    // ReaderState into taskReaderStates, so containsKey returns true and we skip this block.
+    if (!taskReaderStates.containsKey(taskAttemptId)) {
+      context.addTaskCompletionListener[Unit] { ctx =>
+        // In case of early stopping before consuming the entire iterator,
+        // we need to do one more metric update at the end of the task.
+        try {
+          val readerState = taskReaderStates.get(ctx.taskAttemptId())
+          if (readerState != null) {
+            CustomMetrics.updateMetrics(
+              readerState.reader.currentMetricsValues.toImmutableArraySeq, customMetrics)
+            readerState.iterator.forceUpdateMetrics()
+            readerState.reader.close()
+          }
+        } finally {
+          taskReaderStates.remove(ctx.taskAttemptId())
         }
-        valuePrepared = false
-        reader.get()
       }
     }
-    new InterruptibleIterator(context, iter)
+
+    val iterator = new Iterator[Object] {
+      private val inputPartitions = castPartition(split).inputPartitions
+      private var currentIter: Option[Iterator[Object]] = None
+      private var currentIndex: Int = 0
+
+      override def hasNext: Boolean = currentIter.exists(_.hasNext) || advanceToNextIter()
+
+      override def next(): Object = {
+        if (!hasNext) throw new NoSuchElementException("No more elements")
+        currentIter.get.next()
+      }
+
+      private def advanceToNextIter(): Boolean = {
+        if (currentIndex >= inputPartitions.length) {
+          false
+        } else {
+          val inputPartition = inputPartitions(currentIndex)
+          currentIndex += 1
+
+          // TODO: SPARK-25083 remove the type erasure hack in data source scan
+          val (iter, reader) = if (columnarReads) {
+            val batchReader = partitionReaderFactory.createColumnarReader(inputPartition)
+            val iter = new MetricsBatchIterator(
+              new PartitionIterator[ColumnarBatch](batchReader, customMetrics))
+            (iter, batchReader)
+          } else {
+            val rowReader = partitionReaderFactory.createReader(inputPartition)
+            val iter = new MetricsRowIterator(
+              new PartitionIterator[InternalRow](rowReader, customMetrics))
+            (iter, rowReader)
+          }
+
+          // Flush metrics and close the previous reader before advancing to the next one.
+          // Pass the accumulated metrics to the new reader so they carry forward correctly.
+          val prevState = taskReaderStates.get(taskAttemptId)
+          if (prevState != null) {
+            val metrics = prevState.reader.currentMetricsValues
+            CustomMetrics.updateMetrics(metrics.toImmutableArraySeq, customMetrics)
+            reader.initMetricsValues(metrics)
+            prevState.reader.close()
+          }
+
+          // Update the map so the completion listener always references the latest reader.
+          taskReaderStates.put(taskAttemptId, ReaderState(reader, iter))
+
+          currentIter = Some(iter)
+          hasNext
+        }
+      }
+    }
+
+    new InterruptibleIterator(context, iterator).asInstanceOf[Iterator[InternalRow]]
   }
 
   override def getPreferredLocations(split: Partition): Seq[String] = {
-    split.asInstanceOf[DataSourceRDDPartition[T]].inputPartition.preferredLocations()
+    castPartition(split).inputPartitions.flatMap(_.preferredLocations())
+  }
+}
+
+private class PartitionIterator[T](
+    reader: PartitionReader[T],
+    customMetrics: Map[String, SQLMetric]) extends Iterator[T] {
+  private[this] var valuePrepared = false
+  private[this] var hasMoreInput = true
+
+  private var numRow = 0L
+
+  override def hasNext: Boolean = {
+    if (!valuePrepared && hasMoreInput) {
+      hasMoreInput = reader.next()
+      valuePrepared = hasMoreInput
+    }
+    valuePrepared
+  }
+
+  override def next(): T = {
+    if (!hasNext) {
+      throw QueryExecutionErrors.endOfStreamError()
+    }
+    if (numRow % CustomMetrics.NUM_ROWS_PER_UPDATE == 0) {
+      CustomMetrics.updateMetrics(reader.currentMetricsValues.toImmutableArraySeq, customMetrics)
+    }
+    numRow += 1
+    valuePrepared = false
+    reader.get()
+  }
+}
+
+private class MetricsHandler extends Logging with Serializable {
+  private val inputMetrics = TaskContext.get().taskMetrics().inputMetrics
+  private val startingBytesRead = inputMetrics.bytesRead
+  private val getBytesRead = SparkHadoopUtil.get.getFSBytesReadOnThreadCallback()
+
+  def updateMetrics(numRows: Int, force: Boolean = false): Unit = {
+    inputMetrics.incRecordsRead(numRows)
+    val shouldUpdateBytesRead =
+      inputMetrics.recordsRead % SparkHadoopUtil.UPDATE_INPUT_METRICS_INTERVAL_RECORDS == 0
+    if (shouldUpdateBytesRead || force) {
+      inputMetrics.setBytesRead(startingBytesRead + getBytesRead())
+    }
+  }
+}
+
+private abstract class MetricsIterator[I](iter: Iterator[I]) extends Iterator[I] {
+  protected val metricsHandler = new MetricsHandler
+
+  override def hasNext: Boolean = {
+    if (iter.hasNext) {
+      true
+    } else {
+      forceUpdateMetrics()
+      false
+    }
+  }
+
+  def forceUpdateMetrics(): Unit = metricsHandler.updateMetrics(0, force = true)
+}
+
+private class MetricsRowIterator(
+    iter: Iterator[InternalRow]) extends MetricsIterator[InternalRow](iter) {
+  override def next(): InternalRow = {
+    val item = iter.next()
+    metricsHandler.updateMetrics(1)
+    item
+  }
+}
+
+private class MetricsBatchIterator(
+    iter: Iterator[ColumnarBatch]) extends MetricsIterator[ColumnarBatch](iter) {
+  override def next(): ColumnarBatch = {
+    val batch: ColumnarBatch = iter.next()
+    metricsHandler.updateMetrics(batch.numRows)
+    batch
   }
 }

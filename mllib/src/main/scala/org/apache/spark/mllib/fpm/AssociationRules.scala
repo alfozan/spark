@@ -16,7 +16,7 @@
  */
 package org.apache.spark.mllib.fpm
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 
 import org.apache.spark.annotation.Since
@@ -26,6 +26,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.fpm.AssociationRules.Rule
 import org.apache.spark.mllib.fpm.FPGrowth.FreqItemset
 import org.apache.spark.rdd.RDD
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Generates association rules from a `RDD[FreqItemset[Item]]`. This method only generates
@@ -56,28 +57,46 @@ class AssociationRules private[fpm] (
   /**
    * Computes the association rules with confidence above `minConfidence`.
    * @param freqItemsets frequent itemset model obtained from [[FPGrowth]]
-   * @return a `Set[Rule[Item]]` containing the association rules.
+   * @return a `RDD[Rule[Item]]` containing the association rules.
    *
    */
   @Since("1.5.0")
   def run[Item: ClassTag](freqItemsets: RDD[FreqItemset[Item]]): RDD[Rule[Item]] = {
+    run(freqItemsets, Map.empty[Item, Double])
+  }
+
+  /**
+   * Computes the association rules with confidence above `minConfidence`.
+   * @param freqItemsets frequent itemset model obtained from [[FPGrowth]]
+   * @param itemSupport map containing an item and its support
+   * @return a `RDD[Rule[Item]]` containing the association rules. The rules will be able to
+   *         compute also the lift metric.
+   */
+  @Since("2.4.0")
+  def run[Item: ClassTag](freqItemsets: RDD[FreqItemset[Item]],
+      itemSupport: scala.collection.Map[Item, Double]): RDD[Rule[Item]] = {
     // For candidate rule X => Y, generate (X, (Y, freq(X union Y)))
     val candidates = freqItemsets.flatMap { itemset =>
       val items = itemset.items
       items.flatMap { item =>
         items.partition(_ == item) match {
           case (consequent, antecedent) if !antecedent.isEmpty =>
-            Some((antecedent.toSeq, (consequent.toSeq, itemset.freq)))
+            Some((antecedent.toImmutableArraySeq, (consequent.toImmutableArraySeq, itemset.freq)))
           case _ => None
         }
       }
     }
 
     // Join to get (X, ((Y, freq(X union Y)), freq(X))), generate rules, and filter by confidence
-    candidates.join(freqItemsets.map(x => (x.items.toSeq, x.freq)))
-      .map { case (antecendent, ((consequent, freqUnion), freqAntecedent)) =>
-      new Rule(antecendent.toArray, consequent.toArray, freqUnion, freqAntecedent)
-    }.filter(_.confidence >= minConfidence)
+    candidates.join(freqItemsets.map(x => (x.items.toImmutableArraySeq, x.freq)))
+      .map { case (antecedent, ((consequent, freqUnion), freqAntecedent)) =>
+        new Rule(antecedent.toArray,
+          consequent.toArray,
+          freqUnion.toDouble,
+          freqAntecedent.toDouble,
+          // the consequent contains always only one element
+          itemSupport.get(consequent.head))
+      }.filter(_.confidence >= minConfidence)
   }
 
   /**
@@ -106,15 +125,22 @@ object AssociationRules {
   class Rule[Item] private[fpm] (
       @Since("1.5.0") val antecedent: Array[Item],
       @Since("1.5.0") val consequent: Array[Item],
-      freqUnion: Double,
-      freqAntecedent: Double) extends Serializable {
+      private[spark] val freqUnion: Double,
+      freqAntecedent: Double,
+      freqConsequent: Option[Double]) extends Serializable {
 
     /**
      * Returns the confidence of the rule.
      *
      */
     @Since("1.5.0")
-    def confidence: Double = freqUnion.toDouble / freqAntecedent
+    def confidence: Double = freqUnion / freqAntecedent
+
+    /**
+     * Returns the lift of the rule.
+     */
+    @Since("2.4.0")
+    def lift: Option[Double] = freqConsequent.map(fCons => confidence / fCons)
 
     require(antecedent.toSet.intersect(consequent.toSet).isEmpty, {
       val sharedItems = antecedent.toSet.intersect(consequent.toSet)
@@ -142,7 +168,7 @@ object AssociationRules {
 
     override def toString: String = {
       s"${antecedent.mkString("{", ",", "}")} => " +
-        s"${consequent.mkString("{", ",", "}")}: ${confidence}"
+        s"${consequent.mkString("{", ",", "}")}: (confidence: $confidence; lift: $lift)"
     }
   }
 }

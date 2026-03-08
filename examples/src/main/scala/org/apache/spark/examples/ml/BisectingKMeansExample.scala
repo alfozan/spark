@@ -21,6 +21,7 @@ package org.apache.spark.examples.ml
 
 // $example on$
 import org.apache.spark.ml.clustering.BisectingKMeans
+import org.apache.spark.ml.evaluation.ClusteringEvaluator
 // $example off$
 import org.apache.spark.sql.SparkSession
 
@@ -36,7 +37,7 @@ object BisectingKMeansExample {
   def main(args: Array[String]): Unit = {
     // Creates a SparkSession
     val spark = SparkSession
-      .builder
+      .builder()
       .appName("BisectingKMeansExample")
       .getOrCreate()
 
@@ -48,9 +49,14 @@ object BisectingKMeansExample {
     val bkm = new BisectingKMeans().setK(2).setSeed(1)
     val model = bkm.fit(dataset)
 
-    // Evaluate clustering.
-    val cost = model.computeCost(dataset)
-    println(s"Within Set Sum of Squared Errors = $cost")
+    // Make predictions
+    val predictions = model.transform(dataset)
+
+    // Evaluate clustering by computing Silhouette score
+    val evaluator = new ClusteringEvaluator()
+
+    val silhouette = evaluator.evaluate(predictions)
+    println(s"Silhouette with squared euclidean distance = $silhouette")
 
     // Shows the result.
     println("Cluster Centers: ")

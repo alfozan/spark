@@ -21,12 +21,14 @@ import java.io._
 
 import com.google.common.io.Closeables
 
-import org.apache.spark.SparkException
+import org.apache.spark.SparkEnv
 import org.apache.spark.io.NioBufferedFileInputStream
-import org.apache.spark.memory.{MemoryConsumer, TaskMemoryManager}
+import org.apache.spark.memory.TaskMemoryManager
+import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.memory.MemoryBlock
+import org.apache.spark.util.Utils
 
 /**
  * A RowQueue is an FIFO queue for UnsafeRow.
@@ -35,25 +37,7 @@ import org.apache.spark.unsafe.memory.MemoryBlock
  * reader, the reader ALWAYS ran behind the writer. See the doc of class [[BatchEvalPythonExec]]
  * on how it works.
  */
-private[python] trait RowQueue {
-
-  /**
-   * Add a row to the end of it, returns true iff the row has been added to the queue.
-   */
-  def add(row: UnsafeRow): Boolean
-
-  /**
-   * Retrieve and remove the first row, returns null if it's empty.
-   *
-   * It can only be called after add is called, otherwise it will fail (NPE).
-   */
-  def remove(): UnsafeRow
-
-  /**
-   * Cleanup all the resources.
-   */
-  def close(): Unit
-}
+trait RowQueue extends Queue[UnsafeRow]
 
 /**
  * A RowQueue that is based on in-memory page. UnsafeRows are appended into it until it's full.
@@ -108,9 +92,13 @@ private[python] abstract class InMemoryRowQueue(val page: MemoryBlock, numFields
  * A RowQueue that is backed by a file on disk. This queue will stop accepting new rows once any
  * reader has begun reading from the queue.
  */
-private[python] case class DiskRowQueue(file: File, fields: Int) extends RowQueue {
-  private var out = new DataOutputStream(
-    new BufferedOutputStream(new FileOutputStream(file.toString)))
+private[python] case class DiskRowQueue(
+    file: File,
+    fields: Int,
+    serMgr: SerializerManager) extends RowQueue {
+
+  private var out = new DataOutputStream(serMgr.wrapForEncryption(
+    new BufferedOutputStream(new FileOutputStream(file.toString))))
   private var unreadBytes = 0L
 
   private var in: DataInputStream = _
@@ -131,7 +119,8 @@ private[python] case class DiskRowQueue(file: File, fields: Int) extends RowQueu
     if (out != null) {
       out.close()
       out = null
-      in = new DataInputStream(new NioBufferedFileInputStream(file))
+      in = new DataInputStream(serMgr.wrapForEncryption(
+        new NioBufferedFileInputStream(file)))
     }
 
     if (unreadBytes > 0) {
@@ -163,119 +152,40 @@ private[python] case class DiskRowQueue(file: File, fields: Int) extends RowQueu
  * HybridRowQueue could be safely appended in one thread, and pulled in another thread in the same
  * time.
  */
-private[python] case class HybridRowQueue(
+case class HybridRowQueue(
     memManager: TaskMemoryManager,
     tempDir: File,
-    numFields: Int)
-  extends MemoryConsumer(memManager) with RowQueue {
+    numFields: Int,
+    serMgr: SerializerManager)
+  extends HybridQueue[UnsafeRow, RowQueue](memManager, tempDir, serMgr) {
 
-  // Each buffer should have at least one row
-  private var queues = new java.util.LinkedList[RowQueue]()
-
-  private var writing: RowQueue = _
-  private var reading: RowQueue = _
-
-  // exposed for testing
-  private[python] def numQueues(): Int = queues.size()
-
-  def spill(size: Long, trigger: MemoryConsumer): Long = {
-    if (trigger == this) {
-      // When it's triggered by itself, it should write upcoming rows into disk instead of copying
-      // the rows already in the queue.
-      return 0L
-    }
-    var released = 0L
-    synchronized {
-      // poll out all the buffers and add them back in the same order to make sure that the rows
-      // are in correct order.
-      val newQueues = new java.util.LinkedList[RowQueue]()
-      while (!queues.isEmpty) {
-        val queue = queues.remove()
-        val newQueue = if (!queues.isEmpty && queue.isInstanceOf[InMemoryRowQueue]) {
-          val diskQueue = createDiskQueue()
-          var row = queue.remove()
-          while (row != null) {
-            diskQueue.add(row)
-            row = queue.remove()
-          }
-          released += queue.asInstanceOf[InMemoryRowQueue].page.size()
-          queue.close()
-          diskQueue
-        } else {
-          queue
-        }
-        newQueues.add(newQueue)
-      }
-      queues = newQueues
-    }
-    released
+  override protected def createDiskQueue(): RowQueue = {
+    DiskRowQueue(File.createTempFile("buffer", "", tempDir), numFields, serMgr)
   }
 
-  private def createDiskQueue(): RowQueue = {
-    DiskRowQueue(File.createTempFile("buffer", "", tempDir), numFields)
+  override protected def createInMemoryQueue(page: MemoryBlock): RowQueue = {
+    new InMemoryRowQueue(page, numFields) {
+      override def close(): Unit = {
+        freePage(this.page)
+      }
+    }
   }
 
-  private def createNewQueue(required: Long): RowQueue = {
-    val page = try {
-      allocatePage(required)
-    } catch {
-      case _: OutOfMemoryError =>
-        null
-    }
-    val buffer = if (page != null) {
-      new InMemoryRowQueue(page, numFields) {
-        override def close(): Unit = {
-          freePage(page)
-        }
-      }
-    } else {
-      createDiskQueue()
-    }
+  override protected def getRequiredSize(item: UnsafeRow): Long = 4 + item.getSizeInBytes
 
-    synchronized {
-      queues.add(buffer)
-    }
-    buffer
+  override protected def getPageSize(queue: RowQueue): Long =
+    queue.asInstanceOf[InMemoryRowQueue].page.size()
+
+  override protected def isInMemoryQueue(queue: RowQueue): Boolean =
+    queue.isInstanceOf[InMemoryRowQueue]
+}
+
+object HybridRowQueue {
+  def apply(taskMemoryMgr: TaskMemoryManager, file: File, fields: Int): HybridRowQueue = {
+    HybridRowQueue(taskMemoryMgr, file, fields, SparkEnv.get.serializerManager)
   }
 
-  def add(row: UnsafeRow): Boolean = {
-    if (writing == null || !writing.add(row)) {
-      writing = createNewQueue(4 + row.getSizeInBytes)
-      if (!writing.add(row)) {
-        throw new SparkException(s"failed to push a row into $writing")
-      }
-    }
-    true
-  }
-
-  def remove(): UnsafeRow = {
-    var row: UnsafeRow = null
-    if (reading != null) {
-      row = reading.remove()
-    }
-    if (row == null) {
-      if (reading != null) {
-        reading.close()
-      }
-      synchronized {
-        reading = queues.remove()
-      }
-      assert(reading != null, s"queue should not be empty")
-      row = reading.remove()
-      assert(row != null, s"$reading should have at least one row")
-    }
-    row
-  }
-
-  def close(): Unit = {
-    if (reading != null) {
-      reading.close()
-      reading = null
-    }
-    synchronized {
-      while (!queues.isEmpty) {
-        queues.remove().close()
-      }
-    }
+  def apply(taskMemoryMgr: TaskMemoryManager, fields: Int): HybridRowQueue = {
+    apply(taskMemoryMgr, new File(Utils.getLocalDir(SparkEnv.get.conf)), fields)
   }
 }

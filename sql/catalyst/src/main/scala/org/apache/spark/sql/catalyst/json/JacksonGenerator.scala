@@ -18,23 +18,27 @@
 package org.apache.spark.sql.catalyst.json
 
 import java.io.Writer
-import java.nio.charset.StandardCharsets
 
 import com.fasterxml.jackson.core._
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
-import org.apache.spark.sql.catalyst.util.{ArrayData, DateTimeUtils, MapData}
+import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.VariantVal
+import org.apache.spark.util.ArrayImplicits._
 
 /**
- * `JackGenerator` can only be initialized with a `StructType` or a `MapType`.
+ * `JackGenerator` can only be initialized with a `StructType`, a `MapType` or an `ArrayType`.
  * Once it is initialized with `StructType`, it can be used to write out a struct or an array of
  * struct. Once it is initialized with `MapType`, it can be used to write out a map or an array
  * of map. An exception will be thrown if trying to write out a struct if it is initialized with
  * a `MapType`, and vice verse.
  */
-private[sql] class JacksonGenerator(
+class JacksonGenerator(
     dataType: DataType,
     writer: Writer,
     options: JSONOptions) {
@@ -43,39 +47,69 @@ private[sql] class JacksonGenerator(
   // we can directly access data in `ArrayData` without the help of `SpecificMutableRow`.
   private type ValueWriter = (SpecializedGetters, Int) => Unit
 
-  // `JackGenerator` can only be initialized with a `StructType` or a `MapType`.
-  require(dataType.isInstanceOf[StructType] || dataType.isInstanceOf[MapType],
-    "JacksonGenerator only supports to be initialized with a StructType " +
-      s"or MapType but got ${dataType.simpleString}")
+  // `JackGenerator` can only be initialized with a `StructType`, a `MapType`, a `ArrayType` or a
+  // `VariantType`.
+  require(dataType.isInstanceOf[StructType] || dataType.isInstanceOf[MapType]
+    || dataType.isInstanceOf[ArrayType] || dataType.isInstanceOf[VariantType],
+    s"JacksonGenerator only supports to be initialized with a ${StructType.simpleString}, " +
+      s"${MapType.simpleString}, ${ArrayType.simpleString} or ${VariantType.simpleString} but " +
+      s"got ${dataType.catalogString}")
 
   // `ValueWriter`s for all fields of the schema
   private lazy val rootFieldWriters: Array[ValueWriter] = dataType match {
     case st: StructType => st.map(_.dataType).map(makeWriter).toArray
-    case _ => throw new UnsupportedOperationException(
-      s"Initial type ${dataType.simpleString} must be a struct")
+    case _ => throw QueryExecutionErrors.initialTypeNotTargetDataTypeError(
+      dataType, StructType.simpleString)
   }
 
   // `ValueWriter` for array data storing rows of the schema.
   private lazy val arrElementWriter: ValueWriter = dataType match {
-    case st: StructType =>
-      (arr: SpecializedGetters, i: Int) => {
-        writeObject(writeFields(arr.getStruct(i, st.length), st, rootFieldWriters))
-      }
-    case mt: MapType =>
-      (arr: SpecializedGetters, i: Int) => {
-        writeObject(writeMapData(arr.getMap(i), mt, mapElementWriter))
-      }
+    case at: ArrayType => makeWriter(at.elementType)
+    case _: StructType | _: MapType => makeWriter(dataType)
+    case _ => throw QueryExecutionErrors.initialTypeNotTargetDataTypesError(dataType)
   }
 
   private lazy val mapElementWriter: ValueWriter = dataType match {
     case mt: MapType => makeWriter(mt.valueType)
-    case _ => throw new UnsupportedOperationException(
-      s"Initial type ${dataType.simpleString} must be a map")
+    case _ => throw QueryExecutionErrors.initialTypeNotTargetDataTypeError(
+      dataType, MapType.simpleString)
   }
 
-  private val gen = new JsonFactory().createGenerator(writer).setRootValueSeparator(null)
+  private val gen = {
+    val generator = new JsonFactory().createGenerator(writer).setRootValueSeparator(null)
+    if (options.pretty) {
+      generator.setPrettyPrinter(
+        new DefaultPrettyPrinter(PrettyPrinter.DEFAULT_SEPARATORS.withRootSeparator("")))
+    }
+    if (options.writeNonAsciiCharacterAsCodePoint) {
+      generator.setHighestNonEscapedChar(0x7F)
+    }
+    generator
+  }
 
   private val lineSeparator: String = options.lineSeparatorInWrite
+
+  private val timestampFormatter = TimestampFormatter(
+    options.timestampFormatInWrite,
+    options.zoneId,
+    options.locale,
+    legacyFormat = FAST_DATE_FORMAT,
+    isParsing = false)
+  private val timestampNTZFormatter = TimestampFormatter(
+    options.timestampNTZFormatInWrite,
+    options.zoneId,
+    legacyFormat = FAST_DATE_FORMAT,
+    isParsing = false,
+    forTimestampNTZ = true)
+  private val dateFormatter = DateFormatter(
+    options.dateFormatInWrite,
+    options.locale,
+    legacyFormat = FAST_DATE_FORMAT,
+    isParsing = false)
+  private val timeFormatter = options.timeFormatInWrite match {
+    case TimeFormatter.defaultPattern => TimeFormatter.getFractionFormatter()
+    case customPattern => TimeFormatter(customPattern, isParsing = false)
+  }
 
   private def makeWriter(dataType: DataType): ValueWriter = dataType match {
     case NullType =>
@@ -110,21 +144,52 @@ private[sql] class JacksonGenerator(
       (row: SpecializedGetters, ordinal: Int) =>
         gen.writeNumber(row.getDouble(ordinal))
 
-    case StringType =>
+    case _: StringType =>
       (row: SpecializedGetters, ordinal: Int) =>
         gen.writeString(row.getUTF8String(ordinal).toString)
 
     case TimestampType =>
       (row: SpecializedGetters, ordinal: Int) =>
-        val timestampString =
-          options.timestampFormat.format(DateTimeUtils.toJavaTimestamp(row.getLong(ordinal)))
+        val timestampString = timestampFormatter.format(row.getLong(ordinal))
         gen.writeString(timestampString)
+
+    case TimestampNTZType =>
+      (row: SpecializedGetters, ordinal: Int) =>
+      val timestampString =
+        timestampNTZFormatter.format(DateTimeUtils.microsToLocalDateTime(row.getLong(ordinal)))
+      gen.writeString(timestampString)
 
     case DateType =>
       (row: SpecializedGetters, ordinal: Int) =>
-        val dateString =
-          options.dateFormat.format(DateTimeUtils.toJavaDate(row.getInt(ordinal)))
+        val dateString = dateFormatter.format(row.getInt(ordinal))
         gen.writeString(dateString)
+
+    case CalendarIntervalType =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        gen.writeString(row.getInterval(ordinal).toString)
+
+    case YearMonthIntervalType(start, end) =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        val ymString = IntervalUtils.toYearMonthIntervalString(
+          row.getInt(ordinal),
+          IntervalStringStyles.ANSI_STYLE,
+          start,
+          end)
+        gen.writeString(ymString)
+
+    case DayTimeIntervalType(start, end) =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        val dtString = IntervalUtils.toDayTimeIntervalString(
+          row.getLong(ordinal),
+          IntervalStringStyles.ANSI_STYLE,
+          start,
+          end)
+        gen.writeString(dtString)
+
+    case _: TimeType =>
+      (row: SpecializedGetters, ordinal: Int) =>
+        val timeString = timeFormatter.format(row.getLong(ordinal))
+        gen.writeString(timeString)
 
     case BinaryType =>
       (row: SpecializedGetters, ordinal: Int) =>
@@ -149,6 +214,9 @@ private[sql] class JacksonGenerator(
       (row: SpecializedGetters, ordinal: Int) =>
         writeObject(writeMapData(row.getMap(ordinal), mt, valueWriter))
 
+    case VariantType =>
+      (row: SpecializedGetters, ordinal: Int) => write(row.getVariant(ordinal))
+
     // For UDT values, they should be in the SQL type's corresponding value type.
     // We should not see values in the user-defined class at here.
     // For example, VectorUDT's SQL type is an array of double. So, we should expect that v is
@@ -159,8 +227,7 @@ private[sql] class JacksonGenerator(
     case _ =>
       (row: SpecializedGetters, ordinal: Int) =>
         val v = row.get(ordinal, dataType)
-        sys.error(s"Failed to convert value $v (class of ${v.getClass}}) " +
-          s"with the type of $dataType to JSON.")
+        throw QueryExecutionErrors.failToConvertValueToJsonError(v, v.getClass, dataType)
   }
 
   private def writeObject(f: => Unit): Unit = {
@@ -177,6 +244,10 @@ private[sql] class JacksonGenerator(
       if (!row.isNullAt(i)) {
         gen.writeFieldName(field.name)
         fieldWriters(i).apply(row, i)
+      } else if (!options.ignoreNullFields ||
+        (options.writeNullIfWithDefaultValue && field.getExistenceDefaultValue().isDefined)) {
+        gen.writeFieldName(field.name)
+        gen.writeNull()
       }
       i += 1
     }
@@ -229,7 +300,7 @@ private[sql] class JacksonGenerator(
    */
   def write(row: InternalRow): Unit = {
     writeObject(writeFields(
-      fieldWriters = rootFieldWriters,
+      fieldWriters = rootFieldWriters.toImmutableArraySeq,
       row = row,
       schema = dataType.asInstanceOf[StructType]))
   }
@@ -252,6 +323,10 @@ private[sql] class JacksonGenerator(
       fieldWriter = mapElementWriter,
       map = map,
       mapType = dataType.asInstanceOf[MapType]))
+  }
+
+  def write(v: VariantVal): Unit = {
+    gen.writeRawValue(v.toJson(options.zoneId))
   }
 
   def writeLineEnding(): Unit = {

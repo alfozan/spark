@@ -19,22 +19,22 @@ package org.apache.spark.sql.execution.columnar.compression
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
+import org.apache.spark.sql.catalyst.types.PhysicalDataType
 import org.apache.spark.sql.execution.columnar._
 import org.apache.spark.sql.execution.columnar.ColumnarTestUtils._
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
-import org.apache.spark.sql.types.IntegralType
 
 class IntegralDeltaSuite extends SparkFunSuite {
   val nullValue = -1
   testIntegralDelta(new IntColumnStats, INT, IntDelta)
   testIntegralDelta(new LongColumnStats, LONG, LongDelta)
 
-  def testIntegralDelta[I <: IntegralType](
+  def testIntegralDelta[I <: PhysicalDataType](
       columnStats: ColumnStats,
       columnType: NativeColumnType[I],
-      scheme: CompressionScheme) {
+      scheme: CompressionScheme): Unit = {
 
-    def skeleton(input: Seq[I#InternalType]) {
+    def skeleton(input: Seq[Any]): Unit = {
       // -------------
       // Tests encoder
       // -------------
@@ -43,15 +43,16 @@ class IntegralDeltaSuite extends SparkFunSuite {
       val deltas = if (input.isEmpty) {
         Seq.empty[Long]
       } else {
-        (input.tail, input.init).zipped.map {
+        input.tail.lazyZip(input.init).map {
           case (x: Int, y: Int) => (x - y).toLong
           case (x: Long, y: Long) => x - y
+          case other => fail(s"Unexpected input $other")
         }
       }
 
       input.foreach { value =>
         val row = new GenericInternalRow(1)
-        columnType.setField(row, 0, value)
+        columnType.setField(row, 0, value.asInstanceOf[I#InternalType])
         builder.appendFrom(row, 0)
       }
 
@@ -79,7 +80,7 @@ class IntegralDeltaSuite extends SparkFunSuite {
         assertResult(Byte.MinValue, "The first byte should be an escaping mark")(buffer.get())
         assertResult(input.head, "The first value is wrong")(columnType.extract(buffer))
 
-        (input.tail, deltas).zipped.foreach { (value, delta) =>
+        input.tail.lazyZip(deltas).foreach { (value, delta) =>
           if (math.abs(delta) <= Byte.MaxValue) {
             assertResult(delta, "Wrong delta")(buffer.get())
           } else {
@@ -111,12 +112,12 @@ class IntegralDeltaSuite extends SparkFunSuite {
       assert(!decoder.hasNext)
     }
 
-    def skeletonForDecompress(input: Seq[I#InternalType]) {
+    def skeletonForDecompress(input: Seq[I#InternalType]): Unit = {
       val builder = TestCompressibleColumnBuilder(columnStats, columnType, scheme)
       val row = new GenericInternalRow(1)
       val nullRow = new GenericInternalRow(1)
       nullRow.setNullAt(0)
-      input.map { value =>
+      input.foreach { value =>
         if (value == nullValue) {
           builder.appendFrom(nullRow, 0)
         } else {
@@ -135,7 +136,8 @@ class IntegralDeltaSuite extends SparkFunSuite {
       assertResult(scheme.typeId, "Wrong compression scheme ID")(buffer.getInt())
 
       val decoder = scheme.decoder(buffer, columnType)
-      val columnVector = new OnHeapColumnVector(input.length, columnType.dataType)
+      val columnVector = new OnHeapColumnVector(input.length,
+        ColumnarDataTypeUtils.toLogicalDataType(columnType.dataType))
       decoder.decompress(columnVector, input.length)
 
       if (input.nonEmpty) {
@@ -172,9 +174,7 @@ class IntegralDeltaSuite extends SparkFunSuite {
     }
 
     test(s"$scheme: long random series") {
-      // Have to workaround with `Any` since no `ClassTag[I#JvmType]` available here.
-      val input = Array.fill[Any](10000)(makeRandomValue(columnType))
-      skeleton(input.map(_.asInstanceOf[I#InternalType]))
+      skeleton(Seq.fill[I#InternalType](10000)(makeRandomValue(columnType)))
     }
 
 

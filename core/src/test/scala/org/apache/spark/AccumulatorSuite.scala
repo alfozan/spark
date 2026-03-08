@@ -25,14 +25,14 @@ import scala.collection.mutable.ArrayBuffer
 import scala.ref.WeakReference
 import scala.util.control.NonFatal
 
-import org.scalatest.Matchers
 import org.scalatest.exceptions.TestFailedException
+import org.scalatest.matchers.must.Matchers
 
-import org.apache.spark.AccumulatorParam.StringAccumulatorParam
+import org.apache.spark.internal.config.RDD_CACHE_VISIBILITY_TRACKING_ENABLED
 import org.apache.spark.scheduler._
 import org.apache.spark.serializer.JavaSerializer
+import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.{AccumulatorContext, AccumulatorMetadata, AccumulatorV2, LongAccumulator}
-
 
 class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContext {
   import AccumulatorSuite.createLongAccum
@@ -44,21 +44,6 @@ class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContex
       super.afterEach()
     }
   }
-
-  implicit def setAccum[A]: AccumulableParam[mutable.Set[A], A] =
-    new AccumulableParam[mutable.Set[A], A] {
-      def addInPlace(t1: mutable.Set[A], t2: mutable.Set[A]) : mutable.Set[A] = {
-        t1 ++= t2
-        t1
-      }
-      def addAccumulator(t1: mutable.Set[A], t2: A) : mutable.Set[A] = {
-        t1 += t2
-        t1
-      }
-      def zero(t: mutable.Set[A]) : mutable.Set[A] = {
-        new mutable.HashSet[A]()
-      }
-    }
 
   test("accumulator serialization") {
     val ser = new JavaSerializer(new SparkConf).newInstance()
@@ -79,122 +64,6 @@ class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContex
     // value is not reset on the driver
     assert(acc3.value == 10)
     assert(acc3.isAtDriverSide)
-  }
-
-  test ("basic accumulation") {
-    sc = new SparkContext("local", "test")
-    val acc: Accumulator[Int] = sc.accumulator(0)
-
-    val d = sc.parallelize(1 to 20)
-    d.foreach{x => acc += x}
-    acc.value should be (210)
-
-    val longAcc = sc.accumulator(0L)
-    val maxInt = Integer.MAX_VALUE.toLong
-    d.foreach{x => longAcc += maxInt + x}
-    longAcc.value should be (210L + maxInt * 20)
-  }
-
-  test("value not assignable from tasks") {
-    sc = new SparkContext("local", "test")
-    val acc: Accumulator[Int] = sc.accumulator(0)
-
-    val d = sc.parallelize(1 to 20)
-    intercept[SparkException] {
-      d.foreach(x => acc.value = x)
-    }
-  }
-
-  test ("add value to collection accumulators") {
-    val maxI = 1000
-    for (nThreads <- List(1, 10)) { // test single & multi-threaded
-      sc = new SparkContext("local[" + nThreads + "]", "test")
-      val acc: Accumulable[mutable.Set[Any], Any] = sc.accumulable(new mutable.HashSet[Any]())
-      val d = sc.parallelize(1 to maxI)
-      d.foreach {
-        x => acc += x
-      }
-      val v = acc.value.asInstanceOf[mutable.Set[Int]]
-      for (i <- 1 to maxI) {
-        v should contain(i)
-      }
-      resetSparkContext()
-    }
-  }
-
-  test("value not readable in tasks") {
-    val maxI = 1000
-    for (nThreads <- List(1, 10)) { // test single & multi-threaded
-      sc = new SparkContext("local[" + nThreads + "]", "test")
-      val acc: Accumulable[mutable.Set[Any], Any] = sc.accumulable(new mutable.HashSet[Any]())
-      val d = sc.parallelize(1 to maxI)
-      an [SparkException] should be thrownBy {
-        d.foreach {
-          x => acc.value += x
-        }
-      }
-      resetSparkContext()
-    }
-  }
-
-  test ("collection accumulators") {
-    val maxI = 1000
-    for (nThreads <- List(1, 10)) {
-      // test single & multi-threaded
-      sc = new SparkContext("local[" + nThreads + "]", "test")
-      val setAcc = sc.accumulableCollection(mutable.HashSet[Int]())
-      val bufferAcc = sc.accumulableCollection(mutable.ArrayBuffer[Int]())
-      val mapAcc = sc.accumulableCollection(mutable.HashMap[Int, String]())
-      val d = sc.parallelize((1 to maxI) ++ (1 to maxI))
-      d.foreach {
-        x => {setAcc += x; bufferAcc += x; mapAcc += (x -> x.toString)}
-      }
-
-      // Note that this is typed correctly -- no casts necessary
-      setAcc.value.size should be (maxI)
-      bufferAcc.value.size should be (2 * maxI)
-      mapAcc.value.size should be (maxI)
-      for (i <- 1 to maxI) {
-        setAcc.value should contain(i)
-        bufferAcc.value should contain(i)
-        mapAcc.value should contain (i -> i.toString)
-      }
-      resetSparkContext()
-    }
-  }
-
-  test ("localValue readable in tasks") {
-    val maxI = 1000
-    for (nThreads <- List(1, 10)) { // test single & multi-threaded
-      sc = new SparkContext("local[" + nThreads + "]", "test")
-      val acc: Accumulable[mutable.Set[Any], Any] = sc.accumulable(new mutable.HashSet[Any]())
-      val groupedInts = (1 to (maxI/20)).map {x => (20 * (x - 1) to 20 * x).toSet}
-      val d = sc.parallelize(groupedInts)
-      d.foreach {
-        x => acc.localValue ++= x
-      }
-      acc.value should be ((0 to maxI).toSet)
-      resetSparkContext()
-    }
-  }
-
-  test ("garbage collection") {
-    // Create an accumulator and let it go out of scope to test that it's properly garbage collected
-    sc = new SparkContext("local", "test")
-    var acc: Accumulable[mutable.Set[Any], Any] = sc.accumulable(new mutable.HashSet[Any]())
-    val accId = acc.id
-    val ref = WeakReference(acc)
-
-    // Ensure the accumulator is present
-    assert(ref.get.isDefined)
-
-    // Remove the explicit reference to it and allow weak reference to get garbage collected
-    acc = null
-    System.gc()
-    assert(ref.get.isEmpty)
-
-    AccumulatorContext.remove(accId)
-    assert(!AccumulatorContext.get(accId).isDefined)
   }
 
   test("get accum") {
@@ -221,19 +90,38 @@ class AccumulatorSuite extends SparkFunSuite with Matchers with LocalSparkContex
     assert(AccumulatorContext.get(100000).isEmpty)
   }
 
-  test("string accumulator param") {
-    val acc = new Accumulator("", StringAccumulatorParam, Some("darkness"))
-    assert(acc.value === "")
-    acc.setValue("feeds")
-    assert(acc.value === "feeds")
-    acc.add("your")
-    assert(acc.value === "your") // value is overwritten, not concatenated
-    acc += "soul"
-    assert(acc.value === "soul")
-    acc ++= "with"
-    assert(acc.value === "with")
-    acc.merge("kindness")
-    assert(acc.value === "kindness")
+  test("SPARK-41497: accumulators should be reported in the case of task retry with rdd cache") {
+    // Set up a cluster with 2 executors
+    val conf = new SparkConf()
+      .set(RDD_CACHE_VISIBILITY_TRACKING_ENABLED, true)
+      .setMaster("local-cluster[2, 1, 1024]")
+      .setAppName("test")
+    sc = new SparkContext(conf)
+    val myAcc = sc.longAccumulator("myAcc")
+    // Initiate a rdd with only one partition so there's only one task and specify the storage level
+    // with MEMORY_ONLY_2 so that the rdd result will be cached on both two executors.
+    val rdd1 = sc.parallelize(0 until 10, 1).mapPartitions { iter =>
+      myAcc.add(100)
+      iter.map(x => x + 1)
+    }.persist(StorageLevel.MEMORY_ONLY_2)
+
+    val rdd2 = rdd1.filter { x =>
+      val context = TaskContext.get()
+      if (context.attemptNumber() == 0) {
+        throw new RuntimeException("fail the task.")
+      }
+      x >= 0
+    }
+
+    // This will pass since the second task attempt will succeed
+    assert(rdd2.count() === 10)
+    // Even though the first task attempt had cached the data, the accumulator should be reported
+    // by the second attempt.
+    assert(myAcc.value === 100)
+
+    // Should load cache and not update the accumulators since cache is visible now.
+    assert(rdd2.count() === 10)
+    assert(myAcc.value === 100)
   }
 }
 
@@ -256,10 +144,10 @@ private[spark] object AccumulatorSuite {
   }
 
   /**
-   * Make an `AccumulableInfo` out of an [[Accumulable]] with the intent to use the
+   * Make an `AccumulableInfo` out of an `AccumulatorV2` with the intent to use the
    * info as an accumulator update.
    */
-  def makeInfo(a: AccumulatorV2[_, _]): AccumulableInfo = a.toInfo(Some(a.value), None)
+  def makeInfo(a: AccumulatorV2[_, _]): AccumulableInfo = a.toInfoUpdate
 
   /**
    * Run one or more Spark jobs and verify that in at least one job the peak execution memory
@@ -272,7 +160,7 @@ private[spark] object AccumulatorSuite {
     sc.addSparkListener(listener)
     testBody
     // wait until all events have been processed before proceeding to assert things
-    sc.listenerBus.waitUntilEmpty(10 * 1000)
+    sc.listenerBus.waitUntilEmpty()
     val accums = listener.getCompletedStageInfos.flatMap(_.accumulables.values)
     val isSet = accums.exists { a =>
       a.name == Some(PEAK_EXECUTION_MEMORY) && a.value.exists(_.asInstanceOf[Long] > 0L)
@@ -303,7 +191,7 @@ private class SaveInfoListener extends SparkListener {
   def getCompletedStageInfos: Seq[StageInfo] = completedStageInfos.toArray.toSeq
   def getCompletedTaskInfos: Seq[TaskInfo] = completedTaskInfos.values.flatten.toSeq
   def getCompletedTaskInfos(stageId: StageId, stageAttemptId: StageAttemptId): Seq[TaskInfo] =
-    completedTaskInfos.getOrElse((stageId, stageAttemptId), Seq.empty[TaskInfo])
+    completedTaskInfos.getOrElse((stageId, stageAttemptId), Seq.empty[TaskInfo]).toSeq
 
   /**
    * If `jobCompletionCallback` is set, block until the next call has finished.

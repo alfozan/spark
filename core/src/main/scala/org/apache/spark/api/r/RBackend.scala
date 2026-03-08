@@ -17,23 +17,21 @@
 
 package org.apache.spark.api.r
 
-import java.io.{DataInputStream, DataOutputStream, File, FileOutputStream, IOException}
+import java.io.{DataOutputStream, File, FileOutputStream, IOException}
 import java.net.{InetAddress, InetSocketAddress, ServerSocket, Socket}
 import java.util.concurrent.TimeUnit
 
 import io.netty.bootstrap.ServerBootstrap
 import io.netty.channel.{ChannelFuture, ChannelInitializer, EventLoopGroup}
-import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
-import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder
 import io.netty.handler.codec.bytes.{ByteArrayDecoder, ByteArrayEncoder}
 import io.netty.handler.timeout.ReadTimeoutHandler
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.internal.Logging
-import org.apache.spark.network.util.JavaUtils
-import org.apache.spark.util.Utils
+import org.apache.spark.internal.config.R._
+import org.apache.spark.network.util.{IOMode, NettyUtils}
 
 /**
  * Netty-based backend server that is used to communicate between R and Java.
@@ -48,18 +46,17 @@ private[spark] class RBackend {
   private[r] val jvmObjectTracker = new JVMObjectTracker
 
   def init(): (Int, RAuthHelper) = {
-    val conf = new SparkConf()
-    val backendConnectionTimeout = conf.getInt(
-      "spark.r.backendConnectionTimeout", SparkRDefaults.DEFAULT_CONNECTION_TIMEOUT)
-    bossGroup = new NioEventLoopGroup(
-      conf.getInt("spark.r.numRBackendThreads", SparkRDefaults.DEFAULT_NUM_RBACKEND_THREADS))
+    val conf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf())
+    val backendConnectionTimeout = conf.get(R_BACKEND_CONNECTION_TIMEOUT)
+    bossGroup = NettyUtils.createEventLoop(IOMode.NIO, conf.get(R_NUM_BACKEND_THREADS), "RBackend")
     val workerGroup = bossGroup
     val handler = new RBackendHandler(this)
     val authHelper = new RAuthHelper(conf)
+    val channelClass = NettyUtils.getServerChannelClass(IOMode.NIO)
 
     bootstrap = new ServerBootstrap()
       .group(bossGroup, workerGroup)
-      .channel(classOf[NioServerSocketChannel])
+      .channel(channelClass)
 
     bootstrap.childHandler(new ChannelInitializer[SocketChannel]() {
       def initChannel(ch: SocketChannel): Unit = {
@@ -96,11 +93,11 @@ private[spark] class RBackend {
       channelFuture.channel().close().awaitUninterruptibly(10, TimeUnit.SECONDS)
       channelFuture = null
     }
-    if (bootstrap != null && bootstrap.group() != null) {
-      bootstrap.group().shutdownGracefully()
+    if (bootstrap != null && bootstrap.config().group() != null) {
+      bootstrap.config().group().shutdownGracefully()
     }
-    if (bootstrap != null && bootstrap.childGroup() != null) {
-      bootstrap.childGroup().shutdownGracefully()
+    if (bootstrap != null && bootstrap.config().childGroup() != null) {
+      bootstrap.config().childGroup().shutdownGracefully()
     }
     bootstrap = null
     jvmObjectTracker.clear()
@@ -127,9 +124,8 @@ private[spark] object RBackend extends Logging {
       val listenPort = serverSocket.getLocalPort()
       // Connection timeout is set by socket client. To make it configurable we will pass the
       // timeout value to client inside the temp file
-      val conf = new SparkConf()
-      val backendConnectionTimeout = conf.getInt(
-        "spark.r.backendConnectionTimeout", SparkRDefaults.DEFAULT_CONNECTION_TIMEOUT)
+      val conf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf())
+      val backendConnectionTimeout = conf.get(R_BACKEND_CONNECTION_TIMEOUT)
 
       // tell the R process via temporary file
       val path = args(0)
@@ -147,7 +143,7 @@ private[spark] object RBackend extends Logging {
       new Thread("wait for socket to close") {
         setDaemon(true)
         override def run(): Unit = {
-          // any un-catched exception will also shutdown JVM
+          // any uncaught exception will also shutdown JVM
           val buf = new Array[Byte](1024)
           // shutdown JVM if R does not connect back in 10 seconds
           serverSocket.setSoTimeout(10000)

@@ -17,15 +17,13 @@
 
 package org.apache.spark.sql.hive.test
 
-import org.scalatest.BeforeAndAfterAll
-
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.hive.HiveExternalCatalog
 import org.apache.spark.sql.hive.client.HiveClient
 
 
-trait TestHiveSingleton extends SparkFunSuite with BeforeAndAfterAll {
+trait TestHiveSingleton extends SparkFunSuite {
   override protected val enableAutoThreadAudit = false
   protected val spark: SparkSession = TestHive.sparkSession
   protected val hiveContext: TestHiveContext = TestHive
@@ -40,4 +38,11 @@ trait TestHiveSingleton extends SparkFunSuite with BeforeAndAfterAll {
     }
   }
 
+  protected override def afterEach(): Unit = {
+    try {
+      spark.artifactManager.cleanUpResourcesForTesting()
+    } finally {
+      super.afterEach()
+    }
+  }
 }

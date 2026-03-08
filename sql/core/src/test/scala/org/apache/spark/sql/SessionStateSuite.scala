@@ -33,21 +33,27 @@ class SessionStateSuite extends SparkFunSuite {
    * session as this is a singleton HiveSparkSession in HiveSessionStateSuite and it's shared
    * with all Hive test suites.
    */
-  protected var activeSession: SparkSession = _
+  protected var activeSession: classic.SparkSession = _
 
   override def beforeAll(): Unit = {
     super.beforeAll()
-    activeSession = SparkSession.builder().master("local").getOrCreate()
+    activeSession = classic.SparkSession.builder()
+      .master("local")
+      .config("default-config", "default")
+      .getOrCreate()
   }
 
   override def afterAll(): Unit = {
-    if (activeSession != null) {
-      activeSession.stop()
-      activeSession = null
-      SparkSession.clearActiveSession()
-      SparkSession.clearDefaultSession()
+    try {
+      if (activeSession != null) {
+        activeSession.stop()
+        activeSession = null
+        SparkSession.clearActiveSession()
+        SparkSession.clearDefaultSession()
+      }
+    } finally {
+      super.afterAll()
     }
-    super.afterAll()
   }
 
   test("fork new session and inherit RuntimeConfig options") {
@@ -74,6 +80,9 @@ class SessionStateSuite extends SparkFunSuite {
   test("fork new session and inherit function registry and udf") {
     val testFuncName1 = FunctionIdentifier("strlenScala")
     val testFuncName2 = FunctionIdentifier("addone")
+    // Temporary functions registered via spark.udf.register are stored with database="session"
+    val testFuncName1Qualified = FunctionIdentifier(testFuncName1.funcName, Some("session"))
+    val testFuncName2Qualified = FunctionIdentifier(testFuncName2.funcName, Some("session"))
     try {
       activeSession.udf.register(testFuncName1.funcName, (_: String).length + (_: Int))
       val forkedSession = activeSession.cloneSession()
@@ -82,16 +91,19 @@ class SessionStateSuite extends SparkFunSuite {
       assert(forkedSession ne activeSession)
       assert(forkedSession.sessionState.functionRegistry ne
         activeSession.sessionState.functionRegistry)
-      assert(forkedSession.sessionState.functionRegistry.lookupFunction(testFuncName1).nonEmpty)
+      assert(forkedSession.sessionState.functionRegistry
+        .lookupFunction(testFuncName1Qualified).nonEmpty)
 
       // independence
-      forkedSession.sessionState.functionRegistry.dropFunction(testFuncName1)
-      assert(activeSession.sessionState.functionRegistry.lookupFunction(testFuncName1).nonEmpty)
+      forkedSession.sessionState.functionRegistry.dropFunction(testFuncName1Qualified)
+      assert(activeSession.sessionState.functionRegistry
+        .lookupFunction(testFuncName1Qualified).nonEmpty)
       activeSession.udf.register(testFuncName2.funcName, (_: Int) + 1)
-      assert(forkedSession.sessionState.functionRegistry.lookupFunction(testFuncName2).isEmpty)
+      assert(forkedSession.sessionState.functionRegistry
+        .lookupFunction(testFuncName2Qualified).isEmpty)
     } finally {
-      activeSession.sessionState.functionRegistry.dropFunction(testFuncName1)
-      activeSession.sessionState.functionRegistry.dropFunction(testFuncName2)
+      activeSession.sessionState.functionRegistry.dropFunction(testFuncName1Qualified)
+      activeSession.sessionState.functionRegistry.dropFunction(testFuncName2Qualified)
     }
   }
 
@@ -152,6 +164,7 @@ class SessionStateSuite extends SparkFunSuite {
       assert(forkedSession ne activeSession)
       assert(forkedSession.listenerManager ne activeSession.listenerManager)
       runCollectQueryOn(forkedSession)
+      activeSession.sparkContext.listenerBus.waitUntilEmpty()
       assert(collectorA.commands.length == 1) // forked should callback to A
       assert(collectorA.commands(0) == "collect")
 
@@ -159,12 +172,14 @@ class SessionStateSuite extends SparkFunSuite {
       // => changes to forked do not affect original
       forkedSession.listenerManager.register(collectorB)
       runCollectQueryOn(activeSession)
+      activeSession.sparkContext.listenerBus.waitUntilEmpty()
       assert(collectorB.commands.isEmpty) // original should not callback to B
       assert(collectorA.commands.length == 2) // original should still callback to A
       assert(collectorA.commands(1) == "collect")
       // <= changes to original do not affect forked
       activeSession.listenerManager.register(collectorC)
       runCollectQueryOn(forkedSession)
+      activeSession.sparkContext.listenerBus.waitUntilEmpty()
       assert(collectorC.commands.isEmpty) // forked should not callback to C
       assert(collectorA.commands.length == 3) // forked should still callback to A
       assert(collectorB.commands.length == 1) // forked should still callback to B
@@ -212,5 +227,22 @@ class SessionStateSuite extends SparkFunSuite {
   test("fork new session and inherit reference to SharedState") {
     val forkedSession = activeSession.cloneSession()
     assert(activeSession.sharedState eq forkedSession.sharedState)
+  }
+
+  test("SPARK-27253: forked new session should not discard SQLConf overrides") {
+    val key = "default-config"
+    try {
+      // override default config
+      activeSession.conf.set(key, "active")
+
+      val forkedSession = activeSession.cloneSession()
+      assert(forkedSession ne activeSession)
+      assert(forkedSession.conf ne activeSession.conf)
+
+      // forked new session should not discard SQLConf overrides
+      assert(forkedSession.conf.get(key) == "active")
+    } finally {
+      activeSession.conf.unset(key)
+    }
   }
 }

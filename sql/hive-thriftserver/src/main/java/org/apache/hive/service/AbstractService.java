@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,9 +20,12 @@ package org.apache.hive.service;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hive.conf.HiveConf;
+
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 
 /**
  * AbstractService.
@@ -31,12 +33,12 @@ import org.apache.hadoop.hive.conf.HiveConf;
  */
 public abstract class AbstractService implements Service {
 
-  private static final Log LOG = LogFactory.getLog(AbstractService.class);
+  private static final SparkLogger LOG = SparkLoggerFactory.getLogger(AbstractService.class);
 
   /**
    * Service state: initially {@link STATE#NOTINITED}.
    */
-  private STATE state = STATE.NOTINITED;
+  private Service.STATE state = STATE.NOTINITED;
 
   /**
    * Service name.
@@ -70,7 +72,7 @@ public abstract class AbstractService implements Service {
   }
 
   @Override
-  public synchronized STATE getServiceState() {
+  public synchronized Service.STATE getServiceState() {
     return state;
   }
 
@@ -86,7 +88,7 @@ public abstract class AbstractService implements Service {
     ensureCurrentState(STATE.NOTINITED);
     this.hiveConf = hiveConf;
     changeState(STATE.INITED);
-    LOG.info("Service:" + getName() + " is inited.");
+    LOG.info("Service:{} is inited.", MDC.of(LogKeys.SERVICE_NAME, getName()));
   }
 
   /**
@@ -101,7 +103,7 @@ public abstract class AbstractService implements Service {
     startTime = System.currentTimeMillis();
     ensureCurrentState(STATE.INITED);
     changeState(STATE.STARTED);
-    LOG.info("Service:" + getName() + " is started.");
+    LOG.info("Service:{} is started.", MDC.of(LogKeys.SERVICE_NAME, getName()));
   }
 
   /**
@@ -122,7 +124,7 @@ public abstract class AbstractService implements Service {
     }
     ensureCurrentState(STATE.STARTED);
     changeState(STATE.STOPPED);
-    LOG.info("Service:" + getName() + " is stopped.");
+    LOG.info("Service:{} is stopped.", MDC.of(LogKeys.SERVICE_NAME, getName()));
   }
 
   @Override
@@ -159,7 +161,7 @@ public abstract class AbstractService implements Service {
    *           if the service state is different from
    *           the desired state
    */
-  private void ensureCurrentState(STATE currentState) {
+  private void ensureCurrentState(Service.STATE currentState) {
     ServiceOperations.ensureCurrentState(state, currentState);
   }
 
@@ -173,7 +175,7 @@ public abstract class AbstractService implements Service {
    * @param newState
    *          new service state
    */
-  private void changeState(STATE newState) {
+  private void changeState(Service.STATE newState) {
     state = newState;
     // notify listeners
     for (ServiceStateChangeListener l : listeners) {

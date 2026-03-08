@@ -17,6 +17,8 @@
 
 /* Dynamically injected post-processing code for the API docs */
 
+/* global $, MathJax */
+
 $(document).ready(function() {
   var annotations = $("dt:contains('Annotations')").next("dd").children("span.name");
   addBadges(annotations, "AlphaComponent", ":: AlphaComponent ::", '<span class="alphaComponent badge">Alpha Component</span>');
@@ -29,7 +31,7 @@ function addBadges(allAnnotations, name, tag, html) {
   var tags = $(".cmt:contains(" + tag + ")")
 
   // Remove identifier tags from comments
-  tags.each(function(index) {
+  tags.each(function(_ignored_index) {
     var oldHTML = $(this).html();
     var newHTML = oldHTML.replace(tag, "");
     $(this).html(newHTML);
@@ -58,6 +60,7 @@ $(document).ready(function() {
     });
   };
   script.src = ('https:' == document.location.protocol ? 'https://' : 'http://') +
-                'cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML';
+                'cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js' +
+                '?config=TeX-AMS-MML_HTMLorMML';
   document.getElementsByTagName('head')[0].appendChild(script);
 });

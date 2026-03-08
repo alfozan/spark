@@ -19,10 +19,6 @@ package org.apache.spark.ml.feature
 
 import java.{util => ju}
 
-import org.json4s.JsonDSL._
-import org.json4s.JValue
-import org.json4s.jackson.JsonMethods._
-
 import org.apache.spark.SparkException
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.Model
@@ -34,6 +30,7 @@ import org.apache.spark.sql._
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * `Bucketizer` maps a column of continuous features to a column of feature buckets.
@@ -89,7 +86,8 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
   def setOutputCol(value: String): this.type = set(outputCol, value)
 
   /**
-   * Param for how to handle invalid entries. Options are 'skip' (filter out rows with
+   * Param for how to handle invalid entries containing NaN values. Values outside the splits
+   * will always be treated as errors. Options are 'skip' (filter out rows with
    * invalid values), 'error' (throw an error), or 'keep' (keep invalid values in a special
    * additional bucket). Note that in the multiple column case, the invalid handling is applied
    * to all columns. That said for 'error' it will throw an error if any invalids are found in
@@ -99,7 +97,8 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
    */
   @Since("2.1.0")
   override val handleInvalid: Param[String] = new Param[String](this, "handleInvalid",
-    "how to handle invalid entries. Options are skip (filter out rows with invalid values), " +
+    "how to handle invalid entries containing NaN values. Values outside the splits will always " +
+    "be treated as errorsOptions are skip (filter out rows with invalid values), " +
     "error (throw an error), or keep (keep invalid values in a special additional bucket).",
     ParamValidators.inArray(Bucketizer.supportedHandleInvalids))
 
@@ -145,7 +144,7 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
     val transformedSchema = transformSchema(dataset.schema)
 
     val (inputColumns, outputColumns) = if (isSet(inputCols)) {
-      ($(inputCols).toSeq, $(outputCols).toSeq)
+      ($(inputCols).toImmutableArraySeq, $(outputCols).toImmutableArraySeq)
     } else {
       (Seq($(inputCol)), Seq($(outputCol)))
     }
@@ -160,7 +159,7 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
     }
 
     val seqOfSplits = if (isSet(inputCols)) {
-      $(splitsArray).toSeq
+      $(splitsArray).toImmutableArraySeq
     } else {
       Seq($(splits))
     }
@@ -196,7 +195,7 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
     if (isSet(inputCols)) {
       require(getInputCols.length == getOutputCols.length &&
         getInputCols.length == getSplitsArray.length, s"Bucketizer $this has mismatched Params " +
-        s"for multi-column transform.  Params (inputCols, outputCols, splitsArray) should have " +
+        s"for multi-column transform. Params (inputCols, outputCols, splitsArray) should have " +
         s"equal lengths, but they have different lengths: " +
         s"(${getInputCols.length}, ${getOutputCols.length}, ${getSplitsArray.length}).")
 
@@ -216,6 +215,13 @@ final class Bucketizer @Since("1.4.0") (@Since("1.4.0") override val uid: String
   @Since("1.4.1")
   override def copy(extra: ParamMap): Bucketizer = {
     defaultCopy[Bucketizer](extra).setParent(parent)
+  }
+
+  @Since("3.0.0")
+  override def toString: String = {
+    s"Bucketizer: uid=$uid" +
+      get(inputCols).map(c => s", numInputCols=${c.length}").getOrElse("") +
+      get(outputCols).map(c => s", numOutputCols=${c.length}").getOrElse("")
   }
 }
 
@@ -285,7 +291,7 @@ object Bucketizer extends DefaultParamsReadable[Bucketizer] {
         val insertPos = -idx - 1
         if (insertPos == 0 || insertPos == splits.length) {
           throw new SparkException(s"Feature value $feature out of Bucketizer bounds" +
-            s" [${splits.head}, ${splits.last}].  Check your features, or loosen " +
+            s" [${splits.head}, ${splits.last}]. Check your features, or loosen " +
             s"the lower/upper bound constraints.")
         } else {
           insertPos - 1

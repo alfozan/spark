@@ -38,7 +38,9 @@ select a, b, sum(b) from data group by 3;
 select a, b, sum(b) + 2 from data group by 3;
 
 -- negative case: nondeterministic expression
-select a, rand(0), sum(b) from data group by a, 2;
+select a, rand(0), sum(b)
+from 
+(select /*+ REPARTITION(1) */ a, b from data) group by a, 2;
 
 -- negative case: star
 select * from data group by a, b, 1;
@@ -51,6 +53,62 @@ select count(a), a from (select 1 as a) tmp group by 2 having a > 0;
 
 -- mixed cases: group-by ordinals and aliases
 select a, a AS k, count(b) from data group by k, 1;
+
+-- can use ordinal in CUBE
+select a, b, count(1) from data group by cube(1, 2);
+
+-- mixed cases: can use ordinal in CUBE
+select a, b, count(1) from data group by cube(1, b);
+
+-- can use ordinal with cube
+select a, b, count(1) from data group by 1, 2 with cube;
+
+-- can use ordinal in ROLLUP
+select a, b, count(1) from data group by rollup(1, 2);
+
+-- mixed cases: can use ordinal in ROLLUP
+select a, b, count(1) from data group by rollup(1, b);
+
+-- can use ordinal with rollup
+select a, b, count(1) from data group by 1, 2 with rollup;
+
+-- can use ordinal in GROUPING SETS
+select a, b, count(1) from data group by grouping sets((1), (2), (1, 2));
+
+-- mixed cases: can use ordinal in GROUPING SETS
+select a, b, count(1) from data group by grouping sets((1), (b), (a, 2));
+
+select a, b, count(1) from data group by a, 2 grouping sets((1), (b), (a, 2));
+
+-- range error
+select a, b, count(1) from data group by a, -1;
+
+select a, b, count(1) from data group by a, 3;
+
+select a, b, count(1) from data group by cube(-1, 2);
+
+select a, b, count(1) from data group by cube(1, 3);
+
+-- Group by ordinal on subquery with CTE inside
+SELECT (
+  WITH cte AS (SELECT 1)
+  SELECT * FROM cte
+) AS subq1
+FROM
+  VALUES (1)
+GROUP BY
+  1
+;
+
+-- Group by ordinal on subquery with relation
+SELECT (
+  SELECT a FROM data LIMIT 1
+) AS subq1
+FROM
+  VALUES (1)
+GROUP BY
+  1
+;
 
 -- turn off group by ordinal
 set spark.sql.groupByOrdinal=false;
